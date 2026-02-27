@@ -9,6 +9,7 @@
 // PJ 2026-01-07: Service the Real-Time Data Port (RTDP) with the second core.
 //                Essentially a copy of the corresponding code developed for
 //                the Pico2+BU79100G DAQ board.
+// JM 2026-02-27: Changed to deliver 4 channels over RTDP.
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
@@ -258,12 +259,12 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
                 dma_channel_configure(dma_spi0_tx, &tx_cfg,
                                       &spi_get_hw(spi0)->dr, // write address
                                       tx_buffer, // read address
-                                      dma_encode_transfer_count(N_CHAN*2),
+                                      dma_encode_transfer_count(N_CHAN*4), // 4 ch × 4 bytes = 16
                                       false); // start later...
                 dma_channel_configure(dma_spi0_rx, &rx_cfg,
                                       rx_buffer, // write address
                                       &spi_get_hw(spi0)->dr, // read address
-                                      dma_encode_transfer_count(N_CHAN*2),
+                                      dma_encode_transfer_count(N_CHAN*4), // 4 ch × 4 bytes = 16
                                       false); // start later...
                 // At this point, the data bytes are ready to be sent via SPI0,
                 // so we can signal to the external supervisor device that there
