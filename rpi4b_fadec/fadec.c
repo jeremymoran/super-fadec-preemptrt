@@ -17,12 +17,13 @@
  * 2. This program detects that rising edge and immediately pulls the
  *    slave's Chip Select (CS) line LOW (CS is "active low" — LOW means
  *    "talk to me").
- * 3. The Pi then clocks 16 bytes out of the SPI bus.  The slave puts the
+ * 3. The Pi then clocks 13 bytes out of the SPI bus.  The slave puts the
  *    data on MISO; the Pi ignores MOSI (we send zeros).
  * 4. After the transfer the Pi releases CS (back to HIGH) so the bus is
  *    free for the next slave.
- * 5. The 12 bytes contain four 24-bit signed integers (big-endian, MSB first),
- *    sign-extended to int32_t on decode.
+ * 5. Byte 0 is a 0xEB sync header.  The remaining 12 bytes contain four
+ *    24-bit signed integers (big-endian, MSB first), sign-extended to
+ *    int32_t on decode.  Frames whose header byte is not 0xEB are dropped.
  *
  * TWO-THREAD ARCHITECTURE
  * ///////////////////////
@@ -77,7 +78,7 @@
  * ////////////////////
  *   - Mode 3: clock idles HIGH (CPOL=1), data sampled on falling edge (CPHA=1)
  *   - Maximum clock speed: 10 MHz (supported by RP2350 RTDP firmware)
- *   - Frame size: 12 bytes = 4 channels x 3 bytes (24-bit signed, big-endian)
+ *   - Frame size: 13 bytes = 1 sync header (0xEB) + 4 channels x 3 bytes (24-bit signed, big-endian)
  *   - MOSI (Pi→slave) bytes are ignored by the slave; we send zeros
  *
  * BUILD
@@ -238,8 +239,8 @@ static const unsigned int CS_GPIO[N_SLAVES] = {
  *               at a time, but batching avoids extra syscall overhead.
  */
 #define SPI_DEVICE   "/dev/spidev0.0"
-#define SPI_HZ       10000000u   /* 10 MHz                     */
-#define FRAME_BYTES  12u         /* 4 × 24-bit = 12 bytes      */
+#define SPI_HZ       10000000u   /* 10 MHz                                  */
+#define FRAME_BYTES  13u         /* 1 sync header (0xEB) + 4 × 24-bit = 13 bytes */
 #define EVT_BATCH    64          /* edge events per batch read */
 
 
@@ -666,7 +667,7 @@ static void *acq_thread(void *arg)
         /* tx_buf and rx_buf are uint64_t in the kernel ABI (pointer-as-int) */
         xfer[i].tx_buf        = (uint64_t)(uintptr_t)tx_zero;
         xfer[i].rx_buf        = (uint64_t)(uintptr_t)rx[i];
-        xfer[i].len           = FRAME_BYTES;   /* 12 bytes per read          */
+        xfer[i].len           = FRAME_BYTES;   /* 13 bytes per read          */
         xfer[i].speed_hz      = SPI_HZ;        /* 10 MHz                     */
         xfer[i].bits_per_word = 8;             /* 8-bit words                */
         /* cs_change = 0: do not toggle CS between words (we handle it) */
@@ -852,18 +853,24 @@ static void *acq_thread(void *arg)
                 continue;
             }
 
-            /* DECODE 4 x 24-bit signed BIG-ENDIAN → int32_t
-             * ////////////////////////////////////////////////
-             * The slave sends 3 bytes per channel, MSB first.
-             * Channel c occupies bytes [c*3 .. c*3+2]:
-             *   b[0] = bits 23-16, b[1] = bits 15-8, b[2] = bits 7-0
+            /* VALIDATE SYNC HEADER AND DECODE 4 x 24-bit signed BIG-ENDIAN → int32_t
+             * ////////////////////////////////////////////////////////////////////////
+             * Byte 0 is the 0xEB sync header added by the RTDP firmware for
+             * packet synchronisation.  Drop the frame if it is missing.
+             * Channels occupy bytes [1 + c*3 .. 1 + c*3 + 2], MSB first.
              * Sign-extend bit 23 into bits 31-24.
              */
+            if (rx[dev][0] != 0xEB) {
+                atomic_fetch_add_explicit(&g_err_count[dev], 1,
+                                          memory_order_relaxed);
+                continue;
+            }
             sample_frame_t frame;
             frame.device_id    = (uint8_t)dev;
             frame.timestamp_ns = ts;
+            memcpy(frame.raw, rx[dev], FRAME_BYTES);
             for (int c = 0; c < N_CHANNELS; c++) {
-                const uint8_t *b = &rx[dev][c * 3];
+                const uint8_t *b = &rx[dev][1 + c * 3];
                 int32_t raw = ((int32_t)b[0] << 16)
                             | ((int32_t)b[1] <<  8)
                             |  (int32_t)b[2];
@@ -999,19 +1006,15 @@ static void *proc_thread(void *arg)
             interval_frames[dev]++; /* count for rate report */
 
         /*
-         * Print the decoded frame.  Format:
-         *   [<timestamp ns>] <DRDY label>  ch0=<val> ch1=<val> ch2=<val> ch3=<val>
-         *
-         * %-22s: left-align the label in a 22-character field so columns line up.
-         * %-11d: left-align each channel value in an 11-character field.
-         * %llu: unsigned long long — required for uint64_t with printf on Linux.
+         * Print raw bytes for debugging.
+         * Format:  [<timestamp ns>] <DRDY label>  raw: EB 00 27 0F ...
          */
-        printf("[%llu ns] %-22s"
-               "  ch0=%-11d ch1=%-11d ch2=%-11d ch3=%-11d\n",
-               (unsigned long long)frame.timestamp_ns,
-               (dev >= 0 && dev < N_SLAVES) ? DRDY_LABEL[dev] : "?",
-               frame.channels[0], frame.channels[1],
-               frame.channels[2], frame.channels[3]);
+        const char *label = (dev >= 0 && dev < N_SLAVES) ? DRDY_LABEL[dev] : "?";
+        printf("[%llu ns] %-22s  raw:",
+               (unsigned long long)frame.timestamp_ns, label);
+        for (int b = 0; b < FRAME_BYTES; b++)
+            printf(" %02X", frame.raw[b]);
+        printf("\n");
         /* Note: no fflush here — stdio buffers lines automatically when
          * stdout is a terminal.  Add fflush(stdout) if piping to a file. */
     }

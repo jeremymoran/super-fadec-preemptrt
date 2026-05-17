@@ -11,6 +11,7 @@ typedef struct {
     uint8_t  device_id;
     uint64_t timestamp_ns;     // from clock_gettime(CLOCK_MONOTONIC)
     int32_t  channels[4];      // 4 channels, sign-extended to 32-bit
+    uint8_t  raw[13];          // raw SPI bytes: [0]=0xEB sync header, [1..12]=channel data
 } __attribute__((packed)) sample_frame_t;
 
 typedef struct {
