@@ -182,7 +182,6 @@ void set_registers_to_original_values()
 static uint8_t RTDP_dma_buf[2][RTDP_BUF_BYTES];
 static volatile uint32_t RTDP_write_buf_idx = 0; // Which buffer core0 currently writes into.
 static uint8_t RTDP_rx_dummy; // DMA RX drain target (single byte, write-increment disabled).
-static uint8_t rtdp_debug_mode = 0; // When non-zero, sends fixed value 9999 per channel instead of real ADC data.
 // DMA channels are claimed by core0 and passed to core1 so that core0 can
 // unclaim them cleanly after core1 is reset, without relying on core1.
 static uint RTDP_dma_tx_chan;
@@ -463,9 +462,6 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     if (service_RTDP) {
         RTDP_write_buf_idx = 0;
         RTDP_status = RTDP_IDLE;
-        // Pre-fill the sync header byte in both ping-pong buffers; it never changes.
-        RTDP_dma_buf[0][0] = 0xEB;
-        RTDP_dma_buf[1][0] = 0xEB;
         // Claim DMA channels here in core0 scope so they can be unclaimed
         // cleanly after core1 is reset, without relying on core1 to do it.
         RTDP_dma_tx_chan = dma_claim_unused_channel(true);
@@ -555,14 +551,13 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
         //
         if (service_RTDP && RTDP_status == RTDP_IDLE) {
             uint32_t idx = RTDP_write_buf_idx;
-            // Pack sync header (byte 0 is pre-filled with 0xEB) then ADC samples
-            // as 3-byte big-endian (24-bit) starting at offset 1.
-            // In debug mode, substitute the fixed value 9999 for every channel.
+            // Pack the 0xEB sync header followed by ADC samples as
+            // 3-byte big-endian (24-bit) values, one per channel.
+            RTDP_dma_buf[idx][0] = 0xEB;
             for (uint ch = 0; ch < N_CHAN; ++ch) {
-                int32_t val = rtdp_debug_mode ? 9999 : sample_data[ch];
-                RTDP_dma_buf[idx][1 + 3*ch]   = (uint8_t)(val >> 16);
-                RTDP_dma_buf[idx][1 + 3*ch+1] = (uint8_t)(val >> 8);
-                RTDP_dma_buf[idx][1 + 3*ch+2] = (uint8_t)(val);
+                RTDP_dma_buf[idx][1 + 3*ch]   = (uint8_t)(sample_data[ch] >> 16);
+                RTDP_dma_buf[idx][1 + 3*ch+1] = (uint8_t)(sample_data[ch] >> 8);
+                RTDP_dma_buf[idx][1 + 3*ch+2] = (uint8_t)(sample_data[ch]);
             }
             RTDP_status = RTDP_BUSY; // Mark before push so core1 sees BUSY immediately.
             multicore_fifo_push_blocking(idx); // FIFO is empty when RTDP_IDLE, so no stall.
@@ -900,13 +895,6 @@ void interpret_command(char* cmdStr)
         // Report the trigger index (sample number where trigger occurred).
         // This is the fullword index, divide by 4 to get sample number.
         printf("T %u\n", trigger_fullword_index / 4);
-        break;
-    case 'D':
-        // Toggle RTDP debug mode.
-        // When active, every RTDP packet carries the fixed value 9999 on all
-        // channels instead of real ADC data, for testing the RTDP path.
-        rtdp_debug_mode ^= 1;
-        printf("D rtdp_debug_mode %d\n", rtdp_debug_mode);
         break;
     case '0':
         // Clear the data[N_FULLWORDS] array to all zeros.
