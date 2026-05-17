@@ -210,7 +210,7 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
     channel_config_set_write_increment(&rx_cfg, false); // drain into single dummy byte
     //
     uint timeout_period_us = vregister[7];
-    // At 10 MHz (master clock), N_CHAN*3 = 12 bytes transfers in ~9.6 us.
+    // At 20 MHz (SPI0 slave clock), N_CHAN*3 = 12 bytes transfers in ~4.8 us.
     // Keep a generous minimum so the master has time to respond to DATA_RDY.
     if (timeout_period_us < 100) timeout_period_us = 100;
     //
@@ -363,9 +363,10 @@ static inline void write_adc_register(uint8_t reg_addr, uint16_t reg_value)
     uint16_t cmd = 0x6000 | ((reg_addr & 0x3F) << 7); // WREG command with address
     outgoing_bytes_adc[0] = (uint8_t)((cmd & 0xff00) >> 8);
     outgoing_bytes_adc[1] = (uint8_t)(cmd & 0x00ff);
-    outgoing_bytes_adc[2] = (uint8_t)((reg_value & 0xff00) >> 8);
-    outgoing_bytes_adc[3] = (uint8_t)(reg_value & 0x00ff);
-    for (uint i = 4; i < N_BYTES_IN_FRAME; ++i) {
+    outgoing_bytes_adc[2] = 0x00; // Padding: LSB of 24-bit command word
+    outgoing_bytes_adc[3] = (uint8_t)((reg_value & 0xff00) >> 8); // Data word 1, MSB
+    outgoing_bytes_adc[4] = (uint8_t)(reg_value & 0x00ff);        // Data word 1, LSB
+    for (uint i = 5; i < N_BYTES_IN_FRAME; ++i) {
         outgoing_bytes_adc[i] = (uint8_t)0;
     }
 }
@@ -550,7 +551,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
         //
         if (service_RTDP && RTDP_status == RTDP_IDLE) {
             uint32_t idx = RTDP_write_buf_idx;
-            // Pack ADC samples as big-endian bytes directly into the ping-pong
+            // Pack ADC samples as 3-byte big-endian (24-bit) into the ping-pong
             // buffer.  core1's DMA will read from here with no further copy.
             for (uint ch = 0; ch < N_CHAN; ++ch) {
                 RTDP_dma_buf[idx][3*ch]   = (uint8_t)(sample_data[ch] >> 16);

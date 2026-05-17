@@ -21,8 +21,8 @@
  *    data on MISO; the Pi ignores MOSI (we send zeros).
  * 4. After the transfer the Pi releases CS (back to HIGH) so the bus is
  *    free for the next slave.
- * 5. The 16 bytes contain four 32-bit signed integers (big-endian byte
- *    order, meaning the most-significant byte comes first).
+ * 5. The 12 bytes contain four 24-bit signed integers (big-endian, MSB first),
+ *    sign-extended to int32_t on decode.
  *
  * TWO-THREAD ARCHITECTURE
  * ///////////////////////
@@ -77,7 +77,7 @@
  * ////////////////////
  *   - Mode 3: clock idles HIGH (CPOL=1), data sampled on falling edge (CPHA=1)
  *   - Maximum clock speed: 10 MHz (supported by RP2350 RTDP firmware)
- *   - Frame size: 16 bytes = 4 channels x 4 bytes (int32_t, big-endian)
+ *   - Frame size: 12 bytes = 4 channels x 3 bytes (24-bit signed, big-endian)
  *   - MOSI (Pi→slave) bytes are ignored by the slave; we send zeros
  *
  * BUILD
@@ -232,14 +232,14 @@ static const unsigned int CS_GPIO[N_SLAVES] = {
  *               We use SPI_NO_CS to disable the kernel's built-in CS
  *               toggling and drive CS ourselves via GPIO.
  * SPI_HZ      — clock frequency.  The RP2350 RTDP firmware supports 10 MHz.
- * FRAME_BYTES — each read fetches exactly 16 bytes: 4 channels × 4 bytes.
+ * FRAME_BYTES — each read fetches exactly 12 bytes: 4 channels × 3 bytes.
  * EVT_BATCH   — how many GPIO edge events to drain in one go per wakeup.
  *               64 is generous; in practice we rarely see more than 1-2
  *               at a time, but batching avoids extra syscall overhead.
  */
 #define SPI_DEVICE   "/dev/spidev0.0"
 #define SPI_HZ       10000000u   /* 10 MHz                     */
-#define FRAME_BYTES  16u         /* 4 × int32_t = 16 bytes     */
+#define FRAME_BYTES  12u         /* 4 × 24-bit = 12 bytes      */
 #define EVT_BATCH    64          /* edge events per batch read */
 
 
@@ -666,7 +666,7 @@ static void *acq_thread(void *arg)
         /* tx_buf and rx_buf are uint64_t in the kernel ABI (pointer-as-int) */
         xfer[i].tx_buf        = (uint64_t)(uintptr_t)tx_zero;
         xfer[i].rx_buf        = (uint64_t)(uintptr_t)rx[i];
-        xfer[i].len           = FRAME_BYTES;   /* 16 bytes per read          */
+        xfer[i].len           = FRAME_BYTES;   /* 12 bytes per read          */
         xfer[i].speed_hz      = SPI_HZ;        /* 10 MHz                     */
         xfer[i].bits_per_word = 8;             /* 8-bit words                */
         /* cs_change = 0: do not toggle CS between words (we handle it) */
@@ -838,7 +838,7 @@ static void *acq_thread(void *arg)
              * /////////////////////
              * ioctl is still a syscall (~15-20 µs kernel overhead) but
              * is unavoidable for userspace SPI.  The actual wire time
-             * is 12.8 µs at 10 MHz (16 bytes x 8 bits / 10e6 bps). */
+             * is 9.6 µs at 10 MHz (12 bytes x 8 bits / 10e6 bps). */
             int ret = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &xfer[dev]);
 
             /* DEASSERT CS — SINGLE 32-BIT REGISTER WRITE
@@ -852,25 +852,24 @@ static void *acq_thread(void *arg)
                 continue;
             }
 
-            /* DECODE 4 x int32_t BIG-ENDIAN
-             * ////////////////////////////////
-             * The slave sends the most-significant byte first (big-endian).
-             * We reconstruct each 32-bit integer by shifting each byte into
-             * the correct position and OR-ing them together.
-             *
-             * Channel c occupies bytes [c*4 .. c*4+3]:
-             *   b[0] = bits 31-24, b[1] = bits 23-16,
-             *   b[2] = bits 15-8,  b[3] = bits  7-0
+            /* DECODE 4 x 24-bit signed BIG-ENDIAN → int32_t
+             * ////////////////////////////////////////////////
+             * The slave sends 3 bytes per channel, MSB first.
+             * Channel c occupies bytes [c*3 .. c*3+2]:
+             *   b[0] = bits 23-16, b[1] = bits 15-8, b[2] = bits 7-0
+             * Sign-extend bit 23 into bits 31-24.
              */
             sample_frame_t frame;
             frame.device_id    = (uint8_t)dev;
             frame.timestamp_ns = ts;
             for (int c = 0; c < N_CHANNELS; c++) {
-                const uint8_t *b = &rx[dev][c * 4];
-                frame.channels[c] = (int32_t)(  ((uint32_t)b[0] << 24)
-                                               | ((uint32_t)b[1] << 16)
-                                               | ((uint32_t)b[2] <<  8)
-                                               |  (uint32_t)b[3]);
+                const uint8_t *b = &rx[dev][c * 3];
+                int32_t raw = ((int32_t)b[0] << 16)
+                            | ((int32_t)b[1] <<  8)
+                            |  (int32_t)b[2];
+                /* Sign-extend from 24-bit to 32-bit */
+                if (raw & (1 << 23)) raw |= (int32_t)0xFF000000;
+                frame.channels[c] = raw;
             }
 
             /* PUSH TO RING BUFFER — lock-free, no blocking */
