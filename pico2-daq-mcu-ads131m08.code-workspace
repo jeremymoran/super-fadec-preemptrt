@@ -2,12 +2,6 @@
 	"folders": [
 		{
 			"path": "."
-		},
-		{
-			"path": "../eDAQS-programs"
-		},
-		{
-			"path": "../pic18f16q41-COMMS-2-MCU"
 		}
 	],
 	"settings": {
@@ -21,6 +15,12 @@
 			},
 			"debug": {
 				"statusBarVisibility": "hidden"
+			},
+			"variant": {
+				"statusBarVisibility": "compact"
+			},
+			"buildTarget": {
+				"statusBarVisibility": "visible"
 			}
 		},
 		"terminal.integrated.env.windows": {

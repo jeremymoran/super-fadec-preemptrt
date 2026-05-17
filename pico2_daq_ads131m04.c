@@ -10,10 +10,10 @@
 //                Essentially a copy of the corresponding code developed for
 //                the Pico2+BU79100G DAQ board.
 // JM 2026-02-27: Changed to deliver 4 channels over RTDP.
+// JM 2026-05-17: Forked from ADS131M04 to test much faster RTDP speeds.
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
-#include "pico/util/queue.h"
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
 #include "hardware/uart.h"
@@ -28,7 +28,7 @@
 #include <math.h>
 #include <ctype.h>
 
-#define VERSION_STR "v0.44 Pico2 as DAQ-MCU 2026-01-08"
+#define VERSION_STR "v0.5 RP2350 / ADS131M08 as MCU-ADC 2026-05-17"
 
 // Names for the GPIO pins.
 // A. For interaction with the PIC18F26Q71 COMMS-MCU.
@@ -171,157 +171,135 @@ void set_registers_to_original_values()
 // which makes a snapshot of the sampled data available
 // to an external SPI master device.
 //
-// The main loop of the RTDP service function acts upon commands
-// sent from core0 via the queue.
+// core1 blocks on the hardware inter-core FIFO waiting for messages from core0.
+// core0 pushes a ping-pong buffer index when new ADC data is packed and ready,
+// or RTDP_FIFO_STOP to signal termination.
 //
-queue_t RTDP_command_fifo;
-#define RTDP_FIFO_LENGTH 1
-// The commands themselves are uint values.
-#define RTDP_NOP 0
-#define RTDP_STOP 99
-#define RTDP_ADVERTISE_NEW_DATA 1
-// [FIX-ME] Maybe we should use an atomic variable to indicate the status.
-static uint RTDP_status;
-// The status values are also uint values.
-#define RTDP_IDLE 0
-#define RTDP_BUSY 1
-// core0 will drop a copy of new sample data here.
-static int32_t RTDP_data_words[N_CHAN];
+// Ping-pong DMA buffers: pre-packed big-endian bytes, ready for DMA -> SPI TX.
+// core0 packs sample data into one buffer while core1 transmits from the other,
+// eliminating all intermediate copies on the core1 side.
+#define RTDP_BUF_BYTES (N_CHAN * 4)
+static uint8_t RTDP_dma_buf[2][RTDP_BUF_BYTES];
+static volatile uint32_t RTDP_write_buf_idx = 0; // Which buffer core0 currently writes into.
+static uint8_t RTDP_rx_dummy; // DMA RX drain target (single byte, write-increment disabled).
+// DMA channels are claimed by core0 and passed to core1 so that core0 can
+// unclaim them cleanly after core1 is reset, without relying on core1.
+static uint RTDP_dma_tx_chan;
+static uint RTDP_dma_rx_chan;
+// FIFO message values sent from core0 to core1 via the hardware inter-core FIFO:
+//   0 or 1        = ping-pong buffer index carrying new ADC data.
+//   RTDP_FIFO_STOP = terminate core1.
+#define RTDP_FIFO_STOP 0xFFFFFFFFu
+// RTDP operational status (written by core1, read by core0).
+static volatile uint RTDP_status;
+#define RTDP_IDLE    0
+#define RTDP_BUSY    1
+#define RTDP_STOPPED 2
 
 void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
 {
-    uint8_t tx_buffer[N_CHAN*4]; // Send out the data from this buffer.
-    // The data sheet seems to indicate that we have to collect
-    // the incoming data, even if we don't want it.
-    uint8_t rx_buffer[N_CHAN*4]; // Dump the unwanted data here.
-    //
-    // Transfer bytes to and from the SPI peripheral via DMA channels.
-    const uint dma_spi0_tx = dma_claim_unused_channel(true);
-    const uint dma_spi0_rx = dma_claim_unused_channel(true);
-    dma_channel_config tx_cfg = dma_channel_get_default_config(dma_spi0_tx);
-    dma_channel_config rx_cfg = dma_channel_get_default_config(dma_spi0_rx);
+    // DMA channels were claimed by core0 (RTDP_dma_tx_chan / RTDP_dma_rx_chan).
+    // Configure them here since we own the SPI0 peripheral on this core.
+    dma_channel_config tx_cfg = dma_channel_get_default_config(RTDP_dma_tx_chan);
+    dma_channel_config rx_cfg = dma_channel_get_default_config(RTDP_dma_rx_chan);
     channel_config_set_transfer_data_size(&tx_cfg, DMA_SIZE_8);
     channel_config_set_read_increment(&tx_cfg, true);
     channel_config_set_write_increment(&tx_cfg, false);
     channel_config_set_transfer_data_size(&rx_cfg, DMA_SIZE_8);
     channel_config_set_read_increment(&rx_cfg, false);
-    channel_config_set_write_increment(&rx_cfg, true);
+    channel_config_set_write_increment(&rx_cfg, false); // drain into single dummy byte
     //
     uint timeout_period_us = vregister[7];
-    // At 2MHz, 16 bytes transfer in about 64us,
-    // so it does not make much sense to have a very short timeout.
+    // At 20 MHz, N_CHAN*4 bytes transfer in ~12.8 us (8 ch) or ~6.4 us (4 ch).
+    // Keep a generous minimum so the master has time to respond to DATA_RDY.
     if (timeout_period_us < 100) timeout_period_us = 100;
     //
-    // The main responsibility of core1 is to look for incoming commands and act.
-    // This provides a synchronization mechanism, such that core1 advertises
-    // available data only when core0 has put some new data into RTP_data_words,
-    // and core0 will only put new data in that array while core1 is active and idle.
-    //
-    RTDP_status = RTDP_IDLE;
     bool my_spi_is_initialized = false;
-    bool active = true;
-    while (active) {
-        // Wait until we are commanded to do something.
-        uint cmd = RTDP_NOP;
-        queue_remove_blocking(&RTDP_command_fifo, &cmd);
-        switch (cmd) {
-        case RTDP_ADVERTISE_NEW_DATA:
-            { // start new scope
-                RTDP_status = RTDP_BUSY;
-                for (uint i=0; i < N_CHAN; i++) {
-                    // Put the data into the outgoing byte buffer in big-endian layout.
-                    tx_buffer[4*i] = (uint8_t) (RTDP_data_words[i] >> 24);
-                    tx_buffer[4*i+1] = (uint8_t) (RTDP_data_words[i] >> 16);
-                    tx_buffer[4*i+2] = (uint8_t) (RTDP_data_words[i] >> 8);
-                    tx_buffer[4*i+3] = (uint8_t) RTDP_data_words[i];
-                }
-                if (!my_spi_is_initialized) {
-                    // We (conditionally) do the SPI module initialization here
-                    // because it may have been deinitialized by a timeout event,
-                    // or this may be the first use.
-                    // My reading of Section 12.3.4.4. Clock ratios in the data sheet
-                    // seems to indicate that we are limited to about 2MHz serial clock
-                    // in slave mode.
-                    // If we don't care about the MOSI data, we might go faster.
-                    spi_init(spi0, 2000*1000);
-                    spi_set_slave(spi0, true);
-                    spi_set_format(spi0, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
-                    gpio_set_function(SPI0_CSn_PIN, GPIO_FUNC_SPI);
-                    gpio_pull_up(SPI0_CSn_PIN);
-                    gpio_set_function(SPI0_SCK_PIN, GPIO_FUNC_SPI);
-                    gpio_pull_up(SPI0_SCK_PIN);
-                    gpio_set_function(SPI0_TX_PIN, GPIO_FUNC_SPI);
-                    // The dma-transfer requests are paced by the SPI peripheral.
-                    channel_config_set_dreq(&tx_cfg, spi_get_dreq(spi0, true)); // tx
-                    channel_config_set_dreq(&rx_cfg, spi_get_dreq(spi0, false)); // rx
-                    my_spi_is_initialized = true;
-                }
-                dma_channel_configure(dma_spi0_tx, &tx_cfg,
-                                      &spi_get_hw(spi0)->dr, // write address
-                                      tx_buffer, // read address
-                                      dma_encode_transfer_count(N_CHAN*4), // 4 ch × 4 bytes = 16
-                                      false); // start later...
-                dma_channel_configure(dma_spi0_rx, &rx_cfg,
-                                      rx_buffer, // write address
-                                      &spi_get_hw(spi0)->dr, // read address
-                                      dma_encode_transfer_count(N_CHAN*4), // 4 ch × 4 bytes = 16
-                                      false); // start later...
-                // At this point, the data bytes are ready to be sent via SPI0,
-                // so we can signal to the external supervisor device that there
-                // is data to collect.
-                dma_start_channel_mask((1u << dma_spi0_tx) | (1u << dma_spi0_rx));
-                assert_data_ready();
-                // It is up to the external device to collect all of the data
-                // by selecting the Pico2 as a slave SPI device and clocking out
-                // all of the bytes.
-                uint64_t timeout = time_us_64() + timeout_period_us;
-                // Wait for selection by the SPI-master device.
-                // If this does not happen within a reasonable time,
-                // we presume that the SPI-master device is not present
-                // or not paying attention to the DATA_RDY signal,
-                // so we cancel the data transfer.
-                while (gpio_get(SPI0_CSn_PIN)) {
-                    if (time_reached(timeout)) { goto timed_out; }
-                }
-                enable_RTDP_transceiver();
-                // Wait for the data to be clocked out.
-                while (dma_channel_is_busy(dma_spi0_tx) ||
-                       dma_channel_is_busy(dma_spi0_rx)) {
-                    if (time_reached(timeout)) { goto timed_out; }
-                }
-                // Wait for deselection by the SPI-master device.
-                while (!gpio_get(SPI0_CSn_PIN)) {
-                    if (time_reached(timeout)) { goto timed_out; }
-                }
-                // If we arrive here then the data has been transferred through
-                // the SPI peripheral
-                goto finish;
-            timed_out:
-                spi_deinit(spi0);
-                dma_channel_cleanup(dma_spi0_tx);
-                dma_channel_cleanup(dma_spi0_rx);
-                my_spi_is_initialized = false;
-            finish:
-                disable_RTDP_transceiver();
-                clear_data_ready();
-                RTDP_status = RTDP_IDLE;
-            } // end new scope
+    while (true) {
+        // Block here until core0 pushes a message via the hardware inter-core FIFO.
+        uint32_t msg = multicore_fifo_pop_blocking();
+        if (msg == RTDP_FIFO_STOP) {
             break;
-        case RTDP_STOP:
-            spi_deinit(spi0);
-            dma_channel_cleanup(dma_spi0_tx);
-            dma_channel_cleanup(dma_spi0_rx);
-            my_spi_is_initialized = false;
-            clear_data_ready();
-            RTDP_status = RTDP_IDLE;
-            active = false;
-            break;
-        default:
-            {} // do nothing for any other command value
         }
+        //
+        // msg is a ping-pong buffer index (0 or 1).
+        // core0 has already packed the ADC samples as big-endian bytes into
+        // RTDP_dma_buf[msg], so no copy is needed here.
+        uint32_t buf_idx = msg & 1u;
+        //
+        if (!my_spi_is_initialized) {
+            // (Re-)initialise SPI0 as a slave.
+            // RP2350 Section 12.3.4.4: SPI slave clock must be <= f_sys / 12.
+            // At 300 MHz system clock the ceiling is 25 MHz; 20 MHz gives the
+            // SPI master a safe upper limit with comfortable margin.
+            spi_init(spi0, 20000*1000);
+            spi_set_slave(spi0, true);
+            spi_set_format(spi0, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
+            gpio_set_function(SPI0_CSn_PIN, GPIO_FUNC_SPI);
+            gpio_pull_up(SPI0_CSn_PIN);
+            gpio_set_function(SPI0_SCK_PIN, GPIO_FUNC_SPI);
+            gpio_pull_up(SPI0_SCK_PIN);
+            gpio_set_function(SPI0_TX_PIN, GPIO_FUNC_SPI);
+            // Pace DMA transfers with the SPI peripheral.
+            channel_config_set_dreq(&tx_cfg, spi_get_dreq(spi0, true));  // tx
+            channel_config_set_dreq(&rx_cfg, spi_get_dreq(spi0, false)); // rx
+            my_spi_is_initialized = true;
+        }
+        // Configure TX DMA to read directly from the pre-packed ping-pong buffer.
+        // No copy needed: core0 wrote big-endian bytes straight into this buffer.
+        dma_channel_configure(RTDP_dma_tx_chan, &tx_cfg,
+                              &spi_get_hw(spi0)->dr, // write to SPI TX FIFO
+                              RTDP_dma_buf[buf_idx], // read from ping-pong buffer
+                              RTDP_BUF_BYTES,
+                              false); // start later
+        // Configure RX DMA to drain the SPI RX FIFO into a dummy byte.
+        // The PL022 is full-duplex: without draining, the RX FIFO fills after
+        // 4 bytes and the TX stalls.
+        dma_channel_configure(RTDP_dma_rx_chan, &rx_cfg,
+                              &RTDP_rx_dummy,         // write to dummy (no increment)
+                              &spi_get_hw(spi0)->dr,  // read from SPI RX FIFO
+                              RTDP_BUF_BYTES,
+                              false); // start later
+        //
+        dma_start_channel_mask((1u << RTDP_dma_tx_chan) | (1u << RTDP_dma_rx_chan));
+        assert_data_ready();
+        //
+        uint64_t timeout = time_us_64() + timeout_period_us;
+        // Wait for the SPI master to assert chip-select.
+        // If this does not happen in time, the master is absent or not listening.
+        while (gpio_get(SPI0_CSn_PIN)) {
+            if (time_reached(timeout)) { goto timed_out; }
+        }
+        enable_RTDP_transceiver();
+        // Wait for all bytes to be clocked out.
+        while (dma_channel_is_busy(RTDP_dma_tx_chan) ||
+               dma_channel_is_busy(RTDP_dma_rx_chan)) {
+            if (time_reached(timeout)) { goto timed_out; }
+        }
+        // Wait for the SPI master to release chip-select.
+        while (!gpio_get(SPI0_CSn_PIN)) {
+            if (time_reached(timeout)) { goto timed_out; }
+        }
+        goto finish;
+    timed_out:
+        dma_channel_cleanup(RTDP_dma_tx_chan);
+        dma_channel_cleanup(RTDP_dma_rx_chan);
+        spi_deinit(spi0);
+        my_spi_is_initialized = false;
+    finish:
+        disable_RTDP_transceiver();
+        clear_data_ready();
+        RTDP_status = RTDP_IDLE;
     } // end while
-    dma_channel_unclaim(dma_spi0_tx);
-    dma_channel_unclaim(dma_spi0_rx);
+    //
+    // Cleanup on receiving RTDP_FIFO_STOP.
+    if (my_spi_is_initialized) {
+        spi_deinit(spi0);
+    }
+    dma_channel_cleanup(RTDP_dma_tx_chan);
+    dma_channel_cleanup(RTDP_dma_rx_chan);
+    clear_data_ready();
+    RTDP_status = RTDP_STOPPED; // Signal core0 that cleanup is complete.
 } // end void core1_service_RTDP()
 
 //
@@ -480,9 +458,13 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     uint8_t trigger_slope = (uint8_t)vregister[6];
     //
     bool service_RTDP = (vregister[7] != 0);
-    uint cmd = RTDP_STOP;
     if (service_RTDP) {
-        queue_init(&RTDP_command_fifo, sizeof(uint), RTDP_FIFO_LENGTH);
+        RTDP_write_buf_idx = 0;
+        RTDP_status = RTDP_IDLE;
+        // Claim DMA channels here in core0 scope so they can be unclaimed
+        // cleanly after core1 is reset, without relying on core1 to do it.
+        RTDP_dma_tx_chan = dma_claim_unused_channel(true);
+        RTDP_dma_rx_chan = dma_claim_unused_channel(true);
         multicore_launch_core1(core1_service_RTDP);
     }
     //
@@ -566,14 +548,19 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
             data[next_fullword_index_in_data+ch] = sample_data[ch];
         }
         //
-        if (service_RTDP
-            && (queue_is_empty(&RTDP_command_fifo))
-            && RTDP_status == RTDP_IDLE) {
-            for (uint ch=0; ch < N_CHAN; ++ch) {
-                RTDP_data_words[ch] = sample_data[ch];
+        if (service_RTDP && RTDP_status == RTDP_IDLE) {
+            uint32_t idx = RTDP_write_buf_idx;
+            // Pack ADC samples as big-endian bytes directly into the ping-pong
+            // buffer.  core1's DMA will read from here with no further copy.
+            for (uint ch = 0; ch < N_CHAN; ++ch) {
+                RTDP_dma_buf[idx][4*ch]   = (uint8_t)(sample_data[ch] >> 24);
+                RTDP_dma_buf[idx][4*ch+1] = (uint8_t)(sample_data[ch] >> 16);
+                RTDP_dma_buf[idx][4*ch+2] = (uint8_t)(sample_data[ch] >> 8);
+                RTDP_dma_buf[idx][4*ch+3] = (uint8_t)(sample_data[ch]);
             }
-            cmd = RTDP_ADVERTISE_NEW_DATA;
-            queue_add_blocking(&RTDP_command_fifo, &cmd);
+            RTDP_status = RTDP_BUSY; // Mark before push so core1 sees BUSY immediately.
+            multicore_fifo_push_blocking(idx); // FIFO is empty when RTDP_IDLE, so no stall.
+            RTDP_write_buf_idx ^= 1u;   // Switch to the other buffer for next sample.
         }
         //
         if (post_event) {
@@ -616,18 +603,16 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     } // end while (main sampling loop)
     //
     if (service_RTDP) {
-        while (queue_is_full(&RTDP_command_fifo)) {
-            tight_loop_contents();
-        }
-        cmd = RTDP_STOP;
-        queue_add_blocking(&RTDP_command_fifo, &cmd);
-        while ((queue_is_full(&RTDP_command_fifo))
-               || (RTDP_status == RTDP_BUSY)) {
-            // We wait for the last RTDP command to finish.
-            tight_loop_contents();
-        }
-        queue_free(&RTDP_command_fifo);
+        // Wait for any in-progress transfer to complete.
+        while (RTDP_status == RTDP_BUSY) { tight_loop_contents(); }
+        // Send the stop sentinel.  core1 will clean up the SPI peripheral and
+        // DMA channel state, then set RTDP_STOPPED so we know it is safe to
+        // unclaim the channels.
+        multicore_fifo_push_blocking(RTDP_FIFO_STOP);
+        while (RTDP_status != RTDP_STOPPED) { tight_loop_contents(); }
         multicore_reset_core1();
+        dma_channel_unclaim(RTDP_dma_tx_chan);
+        dma_channel_unclaim(RTDP_dma_rx_chan);
     }
     //
     pwm_set_enabled(slice_num, false);
@@ -924,6 +909,11 @@ void interpret_command(char* cmdStr)
 
 int main()
 {
+    // Overclock to 300 MHz to raise the SPI slave clock ceiling.
+    // RP2350 Section 12.3.4.4: max SPI slave clock = f_sys / 12.
+    // At 300 MHz the ceiling is 25 MHz, comfortably above the 20 MHz
+    // target for the Real-Time Data Port.
+    set_sys_clock_khz(300000, true);
 	set_registers_to_original_values();
     stdio_init_all();
 	uart_set_baudrate(uart0, 230400);
