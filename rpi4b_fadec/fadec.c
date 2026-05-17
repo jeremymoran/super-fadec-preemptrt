@@ -17,7 +17,18 @@ core0, Linux kernel, IRQs, housekeeping (isolated from your app)
 core1, DRDY polling + SPI acquisition (real-time, CPU-pinned)
 core2, Main application / data processing (elevated priority)
 core3, spare / Linux overflow / logging
+
+HARDWARE PIN MAPPING
+   DRDY1  >  GPIO 2   (ADC1 DATA READY - input, rising-edge event)
+   MISO   >  GPIO 9   (SPI0 MISO       - input, data from ADC board via RS-485)
+   CLK    >  GPIO 11  (SPI0 SCLK       - output, idles HIGH for SPI Mode 3)
+   CS1    >  GPIO 13  (ADC1 CS         - output, active low)
+   DE     >  GPIO 24  (RTDP_DE  - output, HIGH = RPi RS-485 driver enabled)
+   REN    >  GPIO 25  (RTDP_REn - output, LOW  = RS-485 receiver enabled)
+
 */
+
+
 
 
 void* main_application_thread(void* arg)
