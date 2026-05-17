@@ -178,7 +178,7 @@ void set_registers_to_original_values()
 // Ping-pong DMA buffers: pre-packed big-endian bytes, ready for DMA -> SPI TX.
 // core0 packs sample data into one buffer while core1 transmits from the other,
 // eliminating all intermediate copies on the core1 side.
-#define RTDP_BUF_BYTES (N_CHAN * 4)
+#define RTDP_BUF_BYTES (N_CHAN * 3)  // 3 bytes per channel (24-bit ADC, big-endian)
 static uint8_t RTDP_dma_buf[2][RTDP_BUF_BYTES];
 static volatile uint32_t RTDP_write_buf_idx = 0; // Which buffer core0 currently writes into.
 static uint8_t RTDP_rx_dummy; // DMA RX drain target (single byte, write-increment disabled).
@@ -210,7 +210,7 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
     channel_config_set_write_increment(&rx_cfg, false); // drain into single dummy byte
     //
     uint timeout_period_us = vregister[7];
-    // At 20 MHz, N_CHAN*4 bytes transfer in ~12.8 us (8 ch) or ~6.4 us (4 ch).
+    // At 10 MHz (master clock), N_CHAN*3 = 12 bytes transfers in ~9.6 us.
     // Keep a generous minimum so the master has time to respond to DATA_RDY.
     if (timeout_period_us < 100) timeout_period_us = 100;
     //
@@ -553,10 +553,9 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
             // Pack ADC samples as big-endian bytes directly into the ping-pong
             // buffer.  core1's DMA will read from here with no further copy.
             for (uint ch = 0; ch < N_CHAN; ++ch) {
-                RTDP_dma_buf[idx][4*ch]   = (uint8_t)(sample_data[ch] >> 24);
-                RTDP_dma_buf[idx][4*ch+1] = (uint8_t)(sample_data[ch] >> 16);
-                RTDP_dma_buf[idx][4*ch+2] = (uint8_t)(sample_data[ch] >> 8);
-                RTDP_dma_buf[idx][4*ch+3] = (uint8_t)(sample_data[ch]);
+                RTDP_dma_buf[idx][3*ch]   = (uint8_t)(sample_data[ch] >> 16);
+                RTDP_dma_buf[idx][3*ch+1] = (uint8_t)(sample_data[ch] >> 8);
+                RTDP_dma_buf[idx][3*ch+2] = (uint8_t)(sample_data[ch]);
             }
             RTDP_status = RTDP_BUSY; // Mark before push so core1 sees BUSY immediately.
             multicore_fifo_push_blocking(idx); // FIFO is empty when RTDP_IDLE, so no stall.

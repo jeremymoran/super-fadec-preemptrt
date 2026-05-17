@@ -70,10 +70,8 @@
  *   CS4      GPIO 18   OUTPUT    Chip-select board 4
  *   CS5      GPIO 20   OUTPUT    Chip-select board 5
  *   CS6      GPIO 21   OUTPUT    Chip-select board 6
- *   DE       GPIO 24   OUTPUT    RS-485 driver enable (HIGH=transmit)
- *                                Keep LOW — Pi only receives, never transmits
- *   REN      GPIO 25   OUTPUT    RS-485 receiver enable (active LOW)
- *                                Keep LOW — receiver is always on
+ *   DE       GPIO 24   OUTPUT    RS-485 ENABLE CLOCK OUTPUT (IMPORTANT)
+ *   REN      GPIO 25   OUTPUT    RS-485 RECEIVER ENABLE (IMPORTANT)
  *
  * SPI PROTOCOL DETAILS
  * ////////////////////
@@ -214,16 +212,18 @@ static const unsigned int CS_GPIO[N_SLAVES] = {
  * ///////////////////////
  * The ISL83491 RS-485 transceiver has two enable pins:
  *
- *   DE  (Driver Enable)    HIGH = Pi is transmitting on the bus.
- *                          We NEVER transmit, so we keep this LOW.
+ *   DE  (Driver Enable)    HIGH = driver active (A/B differential pair driven).
+ *                          The Pi's SPI CLK is wired to DI, so DE must be HIGH
+ *                          for the clock to reach the RP2350 over the bus.
  *
  *   /RE (Receiver Enable, active LOW)  LOW = Pi's receiver is active.
- *                          We ALWAYS want to receive, so we keep this LOW.
+ *                          The RP2350 slave data output arrives at RO, so /RE
+ *                          must stay LOW so the Pi can read the SPI MISO data.
  *
- * Both pins are set LOW at startup and never changed during the run.
+ * DE is held HIGH and /RE is held LOW at startup and never changed during the run.
  */
-#define GPIO_DE   24u   /* RS-485 DE  pin — keep LOW (Pi never drives bus) */
-#define GPIO_REN  25u   /* RS-485 /RE pin — keep LOW (receiver always on)  */
+#define GPIO_DE   24u   /* RS-485 DE  pin — hold HIGH (Pi drives CLK via DI)  */
+#define GPIO_REN  25u   /* RS-485 /RE pin — hold LOW  (receiver always on)    */
 
 /*
  * SPI CONFIGURATION
@@ -551,13 +551,14 @@ static void *acq_thread(void *arg)
         goto acq_cleanup;
     }
 
-    /* RS-485 DRIVER ENABLE (DE) — HOLD LOW
-     * //////////////////////////////////////
-     * The ISL83491 transceiver's DE pin must be LOW to keep the Pi in
-     * receive-only mode.  We set it LOW at startup and never change it.
-     * GPIOD_LINE_VALUE_INACTIVE = logical LOW on this output pin.
+    /* RS-485 DRIVER ENABLE (DE) — HOLD HIGH
+     * ////////////////////////////////////////
+     * The Pi's SPI CLK (GPIO 11) is wired to the ISL83491 DI pin.
+     * DE must be HIGH to enable the line driver so the clock signal
+     * is transmitted over the differential pair to the RP2350 slave.
+     * GPIOD_LINE_VALUE_ACTIVE = logical HIGH on this output pin.
      */
-    de_req = request_output_line(chip, GPIO_DE, GPIOD_LINE_VALUE_INACTIVE);
+    de_req = request_output_line(chip, GPIO_DE, GPIOD_LINE_VALUE_ACTIVE);
     if (!de_req) {
         fprintf(stderr, "Cannot request DE GPIO %u: %s\n",
                 GPIO_DE, strerror(errno));
