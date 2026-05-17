@@ -288,6 +288,18 @@ static spsc_ring_t g_ring;
 static atomic_uint_fast64_t g_event_count[N_SLAVES]; /* total DRDY rising edges seen  */
 static atomic_uint_fast64_t g_frame_count[N_SLAVES]; /* frames successfully SPI-read  */
 static atomic_uint_fast64_t g_err_count[N_SLAVES];   /* SPI ioctl errors              */
+
+/*
+ * g_start_ns
+ * //////////
+ * Monotonic timestamp (nanoseconds) captured just before the acquisition
+ * thread is spawned.  Used in the final summary to compute the average
+ * data rate over the entire run: frames / elapsed_seconds = Hz.
+ * Written once in main(), read once after both threads have joined.
+ * No atomics needed — the pthread_join() calls act as a full memory
+ * barrier, guaranteeing main() sees the write before reading it again.
+ */
+static uint64_t g_start_ns;
 static atomic_uint_fast64_t g_dropped;               /* frames dropped (ring was full)*/
 
 
@@ -322,21 +334,6 @@ static uint64_t now_ns(void)
      * Multiply seconds by 1,000,000,000 and add the nanoseconds part. */
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
-
-/*
- * gpio_to_slave()
- * ///////////////
- * Given a GPIO pin number from an edge event, return the 0-based slave index
- * (0 = slave 1, 1 = slave 2, …).  Returns -1 if the GPIO is not in our
- * DRDY_GPIO table (should never happen, but we handle it defensively).
- */
-static int gpio_to_slave(unsigned int gpio)
-{
-    for (int i = 0; i < N_SLAVES; i++)
-        if (DRDY_GPIO[i] == gpio) return i;
-    return -1; /* unknown GPIO — ignore */
-}
-
 
 /* //////////////////////////////////////////////////////////////////////////
  * GPIO HELPER FUNCTIONS (libgpiod v2 API)
@@ -538,6 +535,7 @@ static void *acq_thread(void *arg)
     struct gpiod_line_request      *ren_req  = NULL; /* RS-485 /RE line      */
     struct gpiod_edge_event_buffer *evt_buf  = NULL; /* edge event buffer    */
     int                             spi_fd   = -1;   /* SPI device fd        */
+    volatile uint32_t              *gpio_regs = NULL; /* BCM2711 register map */
 
     memset(cs_req, 0, sizeof(cs_req)); /* initialise all CS handles to NULL */
 
@@ -608,17 +606,8 @@ static void *acq_thread(void *arg)
         goto acq_cleanup;
     }
 
-    /* EDGE EVENT BUFFER
-     * //////////////////
-     * Pre-allocate a buffer that can hold up to EVT_BATCH edge events.
-     * We pass this to gpiod_line_request_read_edge_events() in the loop
-     * to drain all pending events in one call without allocating memory.
-     */
-    evt_buf = gpiod_edge_event_buffer_new(EVT_BATCH);
-    if (!evt_buf) {
-        fprintf(stderr, "Cannot allocate event buffer\n");
-        goto acq_cleanup;
-    }
+    /* evt_buf is declared for cleanup safety but is not used in the hot loop.
+     * The mmap polling approach (see below) replaces the libgpiod event system. */
 
     /* SPI DEVICE INITIALISATION
      * //////////////////////////
@@ -690,131 +679,191 @@ static void *acq_thread(void *arg)
     fflush(stdout); /* flush stdout so the message appears immediately */
 
     /* //////////////////////////////////////////////////////////////////
+     * DIRECT GPIO REGISTER MAPPING — THE KEY TO HIGH-SPEED OPERATION
+     * //////////////////////////////////////////////////////////////////
+     *
+     * WHY THE PREVIOUS LIBGPIOD APPROACH WAS SLOW (~800 Hz observed,
+     * 32000 Hz expected):
+     *
+     * Problem 1 — CS toggling via gpiod_line_request_set_value():
+     *   This function makes a write() syscall to /dev/gpiochip0.
+     *   On Pi 4 each call takes ~50 µs.  With two calls per frame
+     *   (assert + deassert) that alone caps throughput at ~10,000 Hz
+     *   before the SPI transfer is even counted.
+     *
+     * Problem 2 — DRDY detection via gpiod edge events:
+     *   gpiod_line_request_wait_edge_events() uses poll() on the GPIO
+     *   character device.  The kernel's event FIFO has a small default
+     *   capacity.  At 32 kHz it fills in ~500 µs.  If our loop takes
+     *   longer than that, events are silently dropped — we were seeing
+     *   only ~2,100 out of ~86,000 expected events (97.5% loss).
+     *
+     * FIX — direct memory-mapped register access:
+     *   /dev/gpiomem exposes the BCM2711 GPIO hardware registers directly.
+     *   Reading or writing a register is a single 32-bit AXI bus operation
+     *   that takes < 1 ns — no syscall, no kernel round-trip.
+     *
+     *   We use three registers (all at byte offsets from the GPIO base,
+     *   converted to uint32_t array indices by dividing by 4):
+     *
+     *   GPLEV0  (offset 0x34) — read all pin levels simultaneously
+     *   GPSET0  (offset 0x1C) — write 1 to a bit to drive that pin HIGH
+     *   GPCLR0  (offset 0x28) — write 1 to a bit to drive that pin LOW
+     *
+     *   For GPSET0/GPCLR0, bits you write 0 to are ignored (other pins
+     *   are not affected), so we can safely set/clear individual pins
+     *   with a single 32-bit write.
+     *
+     * COMPATIBILITY NOTE:
+     *   We still use libgpiod to configure all GPIO directions and biases
+     *   at startup (input with pull-down for DRDY, output for CS/DE/REN).
+     *   The libgpiod handles are kept open so the kernel driver maintains
+     *   those configurations.  We simply bypass the gpiod API for the
+     *   actual hot-path read/write operations.
+     *
+     *   mmap offset must be 0 — /dev/gpiomem maps the GPIO register block
+     *   starting from register 0; GPIO_BASE (0xFE200000) is a physical
+     *   address, not a file offset, and must not be used here.
+     */
+
+    /* BCM2711 (Pi 4B) GPIO register word-offsets (byte_offset / 4) */
+#define _GPLEV0  (0x34 / 4)   /* Level register:   read  pin states   */
+#define _GPSET0  (0x1C / 4)   /* Set   register:   write 1 = pin HIGH */
+#define _GPCLR0  (0x28 / 4)   /* Clear register:   write 1 = pin LOW  */
+
+    {
+        int mem_fd = open("/dev/gpiomem", O_RDWR | O_SYNC);
+        if (mem_fd < 0) {
+            perror("open /dev/gpiomem");
+            goto acq_cleanup;
+        }
+        gpio_regs = (volatile uint32_t *)mmap(NULL, 4096,
+                        PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, 0);
+        close(mem_fd);
+        if (gpio_regs == MAP_FAILED) {
+            perror("mmap /dev/gpiomem");
+            gpio_regs = NULL;
+            goto acq_cleanup;
+        }
+    }
+
+    /* PRE-COMPUTE PER-SLAVE BITMASKS
+     * /////////////////////////////////
+     * For each slave, pre-compute a single uint32_t with exactly one bit
+     * set — the bit corresponding to that slave's GPIO pin number.
+     * Writing this mask to GPSET0 drives the pin HIGH; writing it to
+     * GPCLR0 drives it LOW.  AND-ing it with GPLEV0 tests the pin level.
+     * Pre-computing avoids repeated bit-shifts inside the hot loop.
+     */
+    uint32_t cs_bit[N_SLAVES];    /* CS GPIO bitmask per slave   */
+    uint32_t drdy_bit[N_SLAVES];  /* DRDY GPIO bitmask per slave */
+    for (int i = 0; i < N_SLAVES; i++) {
+        /* CS_GPIO[i] == 0 means not assigned; leave bitmask as 0 */
+        cs_bit[i]   = CS_GPIO[i] ? (1u << CS_GPIO[i]) : 0u;
+        drdy_bit[i] = (1u << DRDY_GPIO[i]);
+    }
+
+    /* ENSURE ALL CS LINES START DEASSERTED (HIGH)
+     * //////////////////////////////////////////////
+     * Write all CS bits to GPSET0 in one register write.
+     * The hardware ignores the 0-bits; only the 1-bits are affected.
+     */
+    {
+        uint32_t cs_all = 0;
+        for (int i = 0; i < N_SLAVES; i++) cs_all |= cs_bit[i];
+        if (cs_all) gpio_regs[_GPSET0] = cs_all;
+    }
+
+    /* Snapshot the current DRDY register state so the edge-detect logic
+     * has a valid "previous" value before the very first iteration. */
+    uint32_t drdy_prev = gpio_regs[_GPLEV0];
+
+    /* //////////////////////////////////////////////////////////////////
      * HOT LOOP — THIS RUNS CONTINUOUSLY UNTIL CTRL+C
      * //////////////////////////////////////////////////////////////////
      * Design goal: minimum latency between DRDY rising edge and SPI read.
-     * Every operation here has been chosen to avoid syscalls, allocations,
-     * and unpredictable delays.
+     *
+     * DRDY EDGE DETECTION — software edge detect on the raw register:
+     *   1. Read GPLEV0 into drdy_now.
+     *   2. XOR with drdy_prev: bits that CHANGED are set.
+     *   3. AND with drdy_now: of the changed bits, only those now HIGH
+     *      are rising edges (0 -> 1 transitions).
+     *   4. Store drdy_now as drdy_prev for the next iteration.
+     *
+     * If no edges are detected we emit an ARM "yield" hint and spin.
+     * "yield" (the ARM instruction, not sched_yield() the syscall) is
+     * a micro-architectural hint that tells the CPU pipeline it is in
+     * a spin-wait loop, allowing the processor to de-prioritise
+     * speculative execution and save power — it does NOT give up the
+     * core to the scheduler.  __asm__ volatile("yield") is used (not
+     * plain asm) because -std=c11 does not expose the asm keyword, but
+     * __asm__ is a GCC built-in always available regardless of -std.
      */
     while (g_running) {
+        uint32_t drdy_now  = gpio_regs[_GPLEV0];
+        uint32_t new_edges = (drdy_now ^ drdy_prev) & drdy_now; /* rising edges */
+        drdy_prev = drdy_now;
 
-        /* WAIT FOR A DRDY EDGE (BLOCKING)
-         * /////////////////////////////////
-         * gpiod_line_request_wait_edge_events() sleeps (yields the CPU)
-         * until at least one edge event is pending on any of the 6 DRDY
-         * lines, OR until the 1-second timeout expires.
-         *
-         * The 1-second timeout lets us re-check g_running so the thread
-         * exits cleanly after Ctrl+C even if no slave is connected.
-         *
-         * Return values:
-         *   > 0  at least one event is ready to read
-         *   = 0  timeout expired with no events
-         *   < 0  error (EINTR = interrupted by a signal, e.g. Ctrl+C)
-         */
-        int r = gpiod_line_request_wait_edge_events(drdy_req, 1000000000LL);
-        if (r < 0) {
-            if (errno == EINTR) continue; /* signal received — loop and check g_running */
-            perror("wait_edge_events");
-            break; /* unexpected error — exit thread */
+        if (!new_edges) {
+            __asm__ volatile("yield"); /* ARM spin-wait hint, not a syscall */
+            continue;
         }
-        if (r == 0) continue; /* timeout — loop and check g_running */
 
-        /* DRAIN ALL PENDING EDGE EVENTS IN ONE BATCH
-         * ////////////////////////////////////////////
-         * After the wait returns > 0 there may be more than one event
-         * queued (e.g. two slaves fired almost simultaneously).
-         * Read up to EVT_BATCH events at once into the pre-allocated buffer.
-         */
-        int n = gpiod_line_request_read_edge_events(drdy_req, evt_buf,
-                                                    EVT_BATCH);
-        if (n < 0) { perror("read_edge_events"); continue; }
+        /* SERVICE EACH SLAVE THAT HAS A NEW DRDY RISING EDGE */
+        for (int dev = 0; dev < N_SLAVES; dev++) {
+            if (!(new_edges & drdy_bit[dev])) continue;
 
-        /* PROCESS EACH EVENT */
-        for (int ei = 0; ei < n; ei++) {
+            /* Timestamp at the moment we detect the edge.
+             * Using now_ns() here (CLOCK_MONOTONIC) rather than a
+             * kernel event timestamp because we are no longer using
+             * the kernel's event system. */
+            uint64_t ts = now_ns();
 
-            /*
-             * Get a pointer to the ei-th event in the buffer.
-             * Cast away const because the installed libgpiod headers on
-             * this system declare the getter functions without 'const' on
-             * the parameter, so passing a const pointer produces a
-             * -Wdiscarded-qualifiers warning.  The data is not modified.
-             */
-            struct gpiod_edge_event *ev =
-                (struct gpiod_edge_event *)
-                gpiod_edge_event_buffer_get_event(evt_buf, (unsigned long)ei);
-
-            /*
-             * Extract the GPIO line offset (pin number) that fired and
-             * the hardware timestamp in nanoseconds (captured by the
-             * kernel at the moment the edge was detected — more accurate
-             * than calling clock_gettime() here).
-             */
-            unsigned int gpio = gpiod_edge_event_get_line_offset(ev);
-            uint64_t     ts   = gpiod_edge_event_get_timestamp_ns(ev);
-
-            /* Convert GPIO number to slave index (0-based) */
-            int dev = gpio_to_slave(gpio);
-            if (dev < 0) continue; /* unknown GPIO, should never happen */
-
-            /* Count the DRDY edge regardless of whether we SPI-read it */
+            /* Count the DRDY edge for statistics */
             atomic_fetch_add_explicit(&g_event_count[dev], 1,
                                       memory_order_relaxed);
 
-            /* If this slave has no CS pin assigned, we cannot do an SPI
-             * read — just record the event and move on. */
-            if (cs_req[dev] == NULL) continue;
+            /* No CS assigned for this slave — count edge and skip SPI */
+            if (!cs_bit[dev]) continue;
 
-            /* ASSERT CS — SELECT THE SLAVE (DRIVE LOW)
-             * //////////////////////////////////////////
-             * GPIOD_LINE_VALUE_INACTIVE = LOW on an active-low CS pin.
-             * The slave sees CS go LOW and prepares to clock out its frame.
-             */
-            gpiod_line_request_set_value(cs_req[dev], CS_GPIO[dev],
-                                         GPIOD_LINE_VALUE_INACTIVE);
+            /* ASSERT CS — SINGLE 32-BIT REGISTER WRITE, ZERO SYSCALL
+             * //////////////////////////////////////////////////////////
+             * Writing cs_bit[dev] to GPCLR0 drives that GPIO LOW.
+             * Other GPIO pins are unaffected (writing 0 has no effect).
+             * This takes < 1 ns — contrast with ~50 µs for gpiod API. */
+            gpio_regs[_GPCLR0] = cs_bit[dev];
 
-            /* SPI READ — 16 BYTES FROM THE SLAVE
-             * /////////////////////////////////////
-             * ioctl(SPI_IOC_MESSAGE(1)) sends and receives one spi_ioc_transfer.
-             * The slave drives MISO with 16 bytes of ADC data while we clock
-             * 16 zero bytes out on MOSI (which the slave ignores).
-             * At 10 MHz this transfer takes approximately 12.8 µs.
-             */
+            /* SPI READ — 16 BYTES
+             * /////////////////////
+             * ioctl is still a syscall (~15-20 µs kernel overhead) but
+             * is unavoidable for userspace SPI.  The actual wire time
+             * is 12.8 µs at 10 MHz (16 bytes x 8 bits / 10e6 bps). */
             int ret = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &xfer[dev]);
 
-            /* DEASSERT CS — RELEASE THE SLAVE (DRIVE HIGH)
-             * ///////////////////////////////////////////////
-             * Done immediately after the transfer regardless of success/failure.
-             * Leaving CS asserted would lock the bus and block other slaves.
-             */
-            gpiod_line_request_set_value(cs_req[dev], CS_GPIO[dev],
-                                         GPIOD_LINE_VALUE_ACTIVE);
+            /* DEASSERT CS — SINGLE 32-BIT REGISTER WRITE
+             * /////////////////////////////////////////////
+             * Done immediately after the transfer regardless of success. */
+            gpio_regs[_GPSET0] = cs_bit[dev];
 
             if (ret < 0) {
-                /* SPI transfer failed — count the error, skip this frame */
                 atomic_fetch_add_explicit(&g_err_count[dev], 1,
                                           memory_order_relaxed);
                 continue;
             }
 
-            /* DECODE 4 × int32_t BIG-ENDIAN FROM rx[dev][]
-             * ///////////////////////////////////////////////
-             * The slave sends data in big-endian byte order (most significant
-             * byte first).  Standard x86/ARM processors use little-endian
-             * (least significant byte first), so we must swap manually.
+            /* DECODE 4 x int32_t BIG-ENDIAN
+             * ////////////////////////////////
+             * The slave sends the most-significant byte first (big-endian).
+             * We reconstruct each 32-bit integer by shifting each byte into
+             * the correct position and OR-ing them together.
              *
-             * For channel c, the 4 bytes at positions [c*4 .. c*4+3] are:
-             *   b[0] = bits 31-24 (most significant)
-             *   b[1] = bits 23-16
-             *   b[2] = bits 15- 8
-             *   b[3] = bits  7- 0 (least significant)
-             *
-             * We shift and OR them into a uint32_t then cast to int32_t
-             * to preserve the sign bit for negative values.
+             * Channel c occupies bytes [c*4 .. c*4+3]:
+             *   b[0] = bits 31-24, b[1] = bits 23-16,
+             *   b[2] = bits 15-8,  b[3] = bits  7-0
              */
             sample_frame_t frame;
             frame.device_id    = (uint8_t)dev;
-            frame.timestamp_ns = ts; /* kernel-captured hardware timestamp */
+            frame.timestamp_ns = ts;
             for (int c = 0; c < N_CHANNELS; c++) {
                 const uint8_t *b = &rx[dev][c * 4];
                 frame.channels[c] = (int32_t)(  ((uint32_t)b[0] << 24)
@@ -823,12 +872,7 @@ static void *acq_thread(void *arg)
                                                |  (uint32_t)b[3]);
             }
 
-            /* PUSH THE DECODED FRAME INTO THE RING BUFFER
-             * //////////////////////////////////////////////
-             * ring_push() is lock-free (no mutex).  If the ring is full
-             * (proc_thread is not keeping up), the frame is dropped and
-             * g_dropped is incremented so we can diagnose it later.
-             */
+            /* PUSH TO RING BUFFER — lock-free, no blocking */
             if (ring_push(&g_ring, &frame) < 0)
                 atomic_fetch_add_explicit(&g_dropped, 1,
                                           memory_order_relaxed);
@@ -846,6 +890,8 @@ static void *acq_thread(void *arg)
      * The checks (if (x)) prevent double-frees on partial initialisation.
      */
 acq_cleanup:
+    if (gpio_regs && gpio_regs != MAP_FAILED)
+        munmap((void *)gpio_regs, 4096); /* release the memory-mapped GPIO region */
     if (spi_fd >= 0)  close(spi_fd);
     if (evt_buf)      gpiod_edge_event_buffer_free(evt_buf);
     if (drdy_req)     gpiod_line_request_release(drdy_req);
@@ -1032,6 +1078,10 @@ int main(void)
      */
     pthread_t t_acq, t_proc;
 
+    /* Stamp the start time immediately before spawning threads so the
+     * elapsed-time denominator in the final rate calculation is accurate. */
+    g_start_ns = now_ns();
+
     if (pthread_create(&t_proc, NULL, proc_thread, NULL) != 0) {
         perror("pthread_create proc");
         return EXIT_FAILURE;
@@ -1067,21 +1117,45 @@ int main(void)
 
     /* FINAL SUMMARY
      * //////////////
-     * Read and print all atomic counters.
-     * atomic_load() is used (not direct read) to ensure we see the final
-     * values written by the now-stopped threads.
+     * Compute the total elapsed run time and use it to derive the average
+     * data rate for each slave:
+     *
+     *   rate (Hz) = frames_received / elapsed_seconds
+     *
+     * We report both raw Hz and kHz for readability.  At 32 kHz you would
+     * expect to see approximately 32000 Hz / 32.0 kHz per active slave.
+     *
+     * Note: elapsed time starts from just before the threads were spawned,
+     * so the first few frames during thread startup are included, which
+     * makes the average very slightly lower than the true steady-state rate.
+     * For a multi-second run the difference is negligible.
      */
-    printf("\n-- Summary ---------------------------------------------------\n");
+    double elapsed_s = (double)(now_ns() - g_start_ns) / 1e9;
+
+    printf("\n-- Summary (elapsed: %.3f s) ----------------------------------\n",
+           elapsed_s);
+    printf("  %-22s  %8s  %8s  %8s  %8s  %8s\n",
+           "Slave", "DRDY evts", "Frames", "Errors",
+           "Avg rate", "(kHz)");
+    printf("  %-22s  %8s  %8s  %8s  %8s  %8s\n",
+           "----------------------",
+           "--------", "--------", "--------",
+           "--------", "--------");
     for (int i = 0; i < N_SLAVES; i++) {
-        printf("  %-22s  events: %-8llu  frames: %-8llu  errors: %llu\n",
+        uint64_t frames = atomic_load(&g_frame_count[i]);
+        /* Avoid division by zero on a zero-length run */
+        double rate_hz  = (elapsed_s > 0.0) ? (double)frames / elapsed_s : 0.0;
+        double rate_khz = rate_hz / 1000.0;
+        printf("  %-22s  %8llu  %8llu  %8llu  %7.1f Hz  %6.3f kHz\n",
                DRDY_LABEL[i],
                (unsigned long long)atomic_load(&g_event_count[i]),
-               (unsigned long long)atomic_load(&g_frame_count[i]),
-               (unsigned long long)atomic_load(&g_err_count[i]));
+               (unsigned long long)frames,
+               (unsigned long long)atomic_load(&g_err_count[i]),
+               rate_hz, rate_khz);
     }
     /* g_dropped counts frames the ring buffer was too full to accept */
-    printf("  dropped (ring full): %llu\n",
-           (unsigned long long)atomic_load(&g_dropped));
+    printf("  %-22s  dropped (ring full): %llu\n",
+           "", (unsigned long long)atomic_load(&g_dropped));
 
     return EXIT_SUCCESS;
 }
