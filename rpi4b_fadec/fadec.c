@@ -1012,7 +1012,7 @@ static void *proc_thread(void *arg)
         const char *label = (dev >= 0 && dev < N_SLAVES) ? DRDY_LABEL[dev] : "?";
         printf("[%llu ns] %-22s  raw:",
                (unsigned long long)frame.timestamp_ns, label);
-        for (int b = 0; b < FRAME_BYTES; b++)
+        for (unsigned int b = 0; b < FRAME_BYTES; b++)
             printf(" %02X", frame.raw[b]);
         printf("\n");
         /* Note: no fflush here — stdio buffers lines automatically when
