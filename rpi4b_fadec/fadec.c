@@ -290,7 +290,7 @@ static atomic_uint_fast64_t g_event_count[N_SLAVES]; /* total DRDY rising edges 
 static atomic_uint_fast64_t g_frame_count[N_SLAVES]; /* frames successfully SPI-read  */
 static atomic_uint_fast64_t g_err_count[N_SLAVES];   /* SPI ioctl errors              */
 static atomic_uint_fast64_t g_hdr_err_count[N_SLAVES]; /* frames dropped: bad header byte */
-static volatile uint8_t     g_last_bad_frame[N_SLAVES][4]; /* first 4 bytes of last bad frame */
+static volatile uint8_t     g_last_bad_frame[N_SLAVES][FRAME_BYTES]; /* full last bad frame */
 
 /*
  * g_start_ns
@@ -874,8 +874,8 @@ static void *acq_thread(void *arg)
              * Sign-extend bit 23 into bits 31-24.
              */
             if (rx[dev][0] != 0xEB) {
-                /* Capture first 4 bytes so proc_thread can print them */
-                for (int _b = 0; _b < 4; _b++)
+                /* Capture full frame so proc_thread can print it */
+                for (unsigned int _b = 0; _b < FRAME_BYTES; _b++)
                     g_last_bad_frame[dev][_b] = rx[dev][_b];
                 atomic_fetch_add_explicit(&g_hdr_err_count[dev], 1,
                                           memory_order_relaxed);
@@ -1006,17 +1006,17 @@ static void *proc_thread(void *arg)
 
                     if (interval_frames[i] || d_ev) {
                         if (!any) printf("[rate] ");
-                        if (hdr_err > 0)
-                            printf("slave%d: %.0f fr/s  evts=%llu spi_errs=%llu hdr_errs=%llu(last4=0x%02X 0x%02X 0x%02X 0x%02X)  ",
+                        if (hdr_err > 0) {
+                            printf("slave%d: %.0f fr/s  evts=%llu spi_errs=%llu hdr_errs=%llu\n",
                                    i + 1, (double)interval_frames[i] / dt,
                                    (unsigned long long)d_ev,
                                    (unsigned long long)d_spi_err,
-                                   (unsigned long long)hdr_err,
-                                   (unsigned)g_last_bad_frame[i][0],
-                                   (unsigned)g_last_bad_frame[i][1],
-                                   (unsigned)g_last_bad_frame[i][2],
-                                   (unsigned)g_last_bad_frame[i][3]);
-                        else
+                                   (unsigned long long)hdr_err);
+                            printf("  last_bad_frame:");
+                            for (unsigned int _b = 0; _b < FRAME_BYTES; _b++)
+                                printf(" %02X", (unsigned)g_last_bad_frame[i][_b]);
+                            printf("\n");
+                        } else
                             printf("slave%d: %.0f fr/s  evts=%llu spi_errs=%llu  ",
                                    i + 1, (double)interval_frames[i] / dt,
                                    (unsigned long long)d_ev,
@@ -1108,7 +1108,7 @@ int main(void)
         atomic_init(&g_frame_count[i],   0);
         atomic_init(&g_err_count[i],     0);
         atomic_init(&g_hdr_err_count[i], 0);
-        memset((void *)g_last_bad_frame[i], 0, 4);
+        memset((void *)g_last_bad_frame[i], 0, FRAME_BYTES);
     }
     atomic_init(&g_dropped, 0);
 
@@ -1202,11 +1202,13 @@ int main(void)
                (unsigned long long)atomic_load(&g_err_count[i]),
                rate_hz, rate_khz);
         uint64_t hdr_errs = atomic_load(&g_hdr_err_count[i]);
-        if (hdr_errs)
-            printf("    hdr_errs: %llu (last bad frame bytes: 0x%02X 0x%02X 0x%02X 0x%02X)\n",
-                   (unsigned long long)hdr_errs,
-                   (unsigned)g_last_bad_frame[i][0], (unsigned)g_last_bad_frame[i][1],
-                   (unsigned)g_last_bad_frame[i][2], (unsigned)g_last_bad_frame[i][3]);
+        if (hdr_errs) {
+            printf("    hdr_errs: %llu, last bad frame bytes:\n    ",
+                   (unsigned long long)hdr_errs);
+            for (unsigned int _b = 0; _b < FRAME_BYTES; _b++)
+                printf(" %02X", (unsigned)g_last_bad_frame[i][_b]);
+            printf("\n");
+        }
     }
     /* g_dropped counts frames the ring buffer was too full to accept */
     printf("  %-22s  dropped (ring full): %llu\n",
