@@ -7,12 +7,12 @@
 **ADC:** Texas Instruments ADS131M04
 
 ## ADC Board Real-Time Data Port (RTDP) Implementation
-The **Real-Time Data Port** is a dedicated low-latency path that lets an external master device poll the **latest ADC sample set** from the Pico while the main acquisition loop continues logging independently on Core 0.
+The **Real-Time Data Port** is a dedicated low-latency path that lets an external master device poll the **latest ADC sample set** from the Pico while the main acquisition loop continues logging independently on `core0`.
 
 In the current setup, the **Pico acts as the SPI slave** and the **Raspberry Pi 4B FADEC acts as the SPI master**. The Pi watches `DATA_RDY`, asserts `CSn`, waits briefly for the slave/transceiver path to settle, and then clocks out one RTDP frame.
 
 ### Key Features
-- Runs RTDP service on **Core 1** so the main sampling/logging loop on Core 0 is left alone.
+- Runs RTDP service on `core1` so the main sampling/logging loop on `core0` is left alone.
 - Uses **ping-pong DMA buffers** so the newest sample set can be handed to the SPI slave path with minimal CPU work.
 - Exposes the **freshest 4-channel ADC sample set** rather than the full logging buffer.
 - Data format is **13 bytes per frame**: `0xEB` sync header + `4 × 24-bit signed` channel values, big-endian.
@@ -21,14 +21,14 @@ In the current setup, the **Pico acts as the SPI slave** and the **Raspberry Pi 
 - Enabled/disabled via virtual register 7 (`vregister[7]` = RTDP timeout / advertising window in µs).
 
 ### Hardware Pins & Required Circuitry
-| GPIO | Pin Name       | Direction | Function                              | Notes |
-|------|----------------|-----------|---------------------------------------|-------|
-| 17   | SPI0_CSn       | Input     | Chip Select (active low)              | Pulled up on Pico2 |
-| 18   | SPI0_SCK       | Input     | Serial Clock                          | Pulled up on Pico2 |
-| 19   | SPI0_TX (MISO) | Output    | Data output to external master        | RTDP serial data |
-| 27   | DATA_RDY       | Output    | New data available signal             | Goes high when fresh RTDP frame is ready |
-| 20   | RTDP_DE        | Output    | RS-485 Driver Enable                  | High = transmit |
-| 21   | RTDP_REn       | Output    | RS-485 Receiver Enable (active low)   | Low = receiver enabled |
+| RP2350 GPIO | Pin Name       | Direction | Function                              | Notes |
+|-------------|----------------|-----------|---------------------------------------|-------|
+| 17          | CSn            | Input     | Chip Select (GPIO-direct)             | Pulled up on Pico2 |
+| 18          | SCK            | Input     | Serial Clock  (via RS485 bus)         | Pulled up on Pico2 |
+| 19          | TX             | Output    | Data output (via RS485 bus)           | RTDP serial data |
+| 27          | DRDY           | Output    | New data available (GPIO-direct)      | Goes high when fresh RTDP frame is ready |
+| 20          | RTDP_DE        | Output    | RS-485 Driver Enable                  | High = transmit |
+| 21          | RTDP_REn       | Output    | RS-485 Receiver Enable (active low)   | Low = receiver enabled |
 
 ### FADEC External Hardware
 - **ISL83491 transceiver**
@@ -38,8 +38,44 @@ In the current setup, the **Pico acts as the SPI slave** and the **Raspberry Pi 
   - /RE -> GPIO21
 
 **SPI Mode:** Mode 3 (CPOL=1, CPHA=1)  
-**Pico SPI0 slave configured for:** up to 20 MHz in firmware  
-**Pi FADEC currently using:** 10 MHz
+**Clock/Data transport:** `SCK` and returned RTDP data both pass through RS-485 line drivers  
+**Checked-in RTDP default:** `RTDP_SPI_HZ = 2 MHz` in the shared `rtdp.h` config header
+
+### Propagation Limits Of The Line Drivers
+
+The ISL83491 is a **10 Mbps full-duplex RS-485/RS-422 transceiver**, but that
+headline number does **not** translate directly into a safe SPI clock frequency.
+In this RTDP design the line drivers are carrying **two timing-related paths**:
+
+- the Pi-generated `SCK` path to the Pico slave
+- the Pico-returned RTDP data path back to the Pi
+
+Those two paths do not have exactly the same delay. Even when both waveforms look
+clean on a logic analyser, the **difference in propagation delay and skew** between
+the clock path and the data path reduces the setup/hold margin seen by the SPI
+receiver.
+
+That matters much more for SPI than for asynchronous serial links:
+
+- a UART-style "10 Mbps" part only has to move bits quickly enough
+- SPI must deliver data with the correct timing **relative to the sampling edge of the clock**
+
+In practice, the ISL83491 therefore limits the usable RTDP SPI clock well below
+its nominal line-rate number, especially when:
+
+- `SCK` and returned data use separate transceiver channels
+- the bus has stubs or shared-node loading
+- cable length, termination, or biasing are not ideal
+- the master samples close to the edge of the available timing window
+
+Observed behaviour on this hardware has been:
+
+- `2 MHz`: reliable
+- `6-8 MHz`: marginal / sensitive to conditions
+- `20 MHz`: not reliable
+
+So the practical ceiling is set by **clock-to-data timing margin through the
+line drivers**, not by the RP2350 firmware alone.
 
 ### RTDP Frame Format
 
@@ -83,12 +119,15 @@ If the external master does **not** respond within the timeout (`vregister[7]`),
 ### Timing Notes
 
 - The first byte is the most timing-sensitive part of the transfer.
-- The Pico now stages `0xEB` into the SPI TX FIFO before `DATA_RDY` is asserted so the header is already present when clocking begins.
-- The Pi FADEC code currently inserts about **2 µs** between asserting **CSn** and starting SCK.
-- That CS-setup delay is intended to cover both:
-  - SPI slave first-byte setup
-  - ISL83491 driver-enable latency
-- In practice, keeping at least **1–2 µs** of CS-setup delay is recommended for reliable frame alignment.
+- A clean-looking `SCK` waveform is not sufficient; what matters is the relative
+  timing of `SCK` and returned data at the Pi input after both line-driver paths.
+- The Pico stages the RTDP frame before clocking begins, but higher SPI clocks can
+  still fail if the returned data arrives too late relative to the Pi sampling edge.
+- The Pi FADEC code inserts a short CS-setup delay before starting `SCK`, but this
+  only covers slave select and driver turn-on. It does **not** remove propagation
+  skew between the RS-485 clock path and the RS-485 data-return path.
+- If header bytes begin to corrupt at higher speeds, treat that as a transport-margin
+  problem first, not as an ADC or packet-format problem.
 
 ### What RTDP Is And Is Not
 
