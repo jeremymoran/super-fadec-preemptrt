@@ -109,6 +109,7 @@
  * frame type (sample_frame_t) shared between the two threads.
  */
 #include "fadec.h"
+#include "../rtdp.h"
 
 /* STANDARD C LIBRARY HEADERS */
 #include <stdio.h>      /* printf, fprintf, perror                     */
@@ -239,7 +240,7 @@ static const unsigned int CS_GPIO[N_SLAVES] = {
  *               at a time, but batching avoids extra syscall overhead.
  */
 #define SPI_DEVICE   "/dev/spidev0.0"
-#define SPI_HZ       6000000u    /* 6 MHz                                   */
+#define SPI_HZ       RTDP_SPI_HZ /* shared with Pico RTDP firmware          */
 #define FRAME_BYTES  13u         /* 1 sync header (0xEB) + 4 × 24-bit = 13 bytes */
 #define CS_SETUP_DELAY_NS 5000u  /* CS low to first clock; shared-bus turnaround margin */
 #define EVT_BATCH    64          /* edge events per batch read */
