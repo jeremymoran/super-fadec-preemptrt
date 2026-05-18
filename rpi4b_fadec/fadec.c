@@ -232,14 +232,15 @@ static const unsigned int CS_GPIO[N_SLAVES] = {
  * SPI_DEVICE  — the Linux device file for SPI bus 0, chip-select 0.
  *               We use SPI_NO_CS to disable the kernel's built-in CS
  *               toggling and drive CS ourselves via GPIO.
- * SPI_HZ      — clock frequency.  The RP2350 RTDP firmware supports 10 MHz.
+ * SPI_HZ      — clock frequency.  Use the older known-good 2 MHz transport
+ *               while validating the newer 13-byte header format.
  * FRAME_BYTES — each read fetches exactly 12 bytes: 4 channels × 3 bytes.
  * EVT_BATCH   — how many GPIO edge events to drain in one go per wakeup.
  *               64 is generous; in practice we rarely see more than 1-2
  *               at a time, but batching avoids extra syscall overhead.
  */
 #define SPI_DEVICE   "/dev/spidev0.0"
-#define SPI_HZ       20000000u   /* 20 MHz                                  */
+#define SPI_HZ       2000000u    /* 2 MHz                                   */
 #define FRAME_BYTES  13u         /* 1 sync header (0xEB) + 4 × 24-bit = 13 bytes */
 #define CS_SETUP_DELAY_NS 5000u  /* CS low to first clock; shared-bus turnaround margin */
 #define EVT_BATCH    64          /* edge events per batch read */

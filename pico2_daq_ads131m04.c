@@ -193,7 +193,7 @@ void set_registers_to_original_values()
 #define RTDP_BUF_BYTES (1 + N_CHAN * 3)  // 1 sync header byte (0xEB) + 3 bytes per channel (24-bit ADC, big-endian)
 static uint8_t RTDP_dma_buf[2][RTDP_BUF_BYTES];
 static volatile uint32_t RTDP_write_buf_idx = 0; // Which buffer core0 currently writes into.
-static uint8_t RTDP_rx_dummy; // DMA RX drain target (single byte, write-increment disabled).
+static uint8_t RTDP_rx_buf[RTDP_BUF_BYTES]; // DMA RX drain target; discard received bytes.
 // DMA channels are claimed by core0 and passed to core1 so that core0 can
 // unclaim them cleanly after core1 is reset, without relying on core1.
 static uint RTDP_dma_tx_chan;
@@ -232,12 +232,12 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
     channel_config_set_write_increment(&tx_cfg, false);
     channel_config_set_transfer_data_size(&rx_cfg, DMA_SIZE_8);
     channel_config_set_read_increment(&rx_cfg, false);
-    channel_config_set_write_increment(&rx_cfg, false); // drain into single dummy byte
+    channel_config_set_write_increment(&rx_cfg, true);
     multicore_fifo_drain();
     multicore_fifo_clear_irq();
     //
     uint timeout_period_us = vregister[7];
-    // At 20 MHz (SPI0 slave clock), N_CHAN*3 = 12 bytes transfers in ~4.8 us.
+    // At 2 MHz (SPI0 slave clock), N_CHAN*3 = 12 bytes transfers in ~48 us.
     // Keep a generous minimum so the master has time to respond to DATA_RDY.
     if (timeout_period_us < 100) timeout_period_us = 100;
     //
@@ -257,10 +257,10 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
         //
         if (!my_spi_is_initialized) {
             // (Re-)initialise SPI0 as a slave.
-            // RP2350 Section 12.3.4.4: SPI slave clock must be <= f_sys / 12.
-            // At 300 MHz system clock the ceiling is 25 MHz; 20 MHz gives the
-            // SPI master a safe upper limit with comfortable margin.
-            spi_init(spi0, 20000*1000);
+            // The older RTDP transport was reliable at 2 MHz on this shared
+            // RS-485 bus, so use that as the transport baseline while the
+            // header framing is being debugged.
+            spi_init(spi0, 2000*1000);
             spi_set_slave(spi0, true);
             spi_set_format(spi0, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
             gpio_set_function(SPI0_CSn_PIN, GPIO_FUNC_SPI);
@@ -281,21 +281,22 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
         }
         drain_RTDP_spi_rx_fifo();
         // Configure TX DMA to read directly from the pre-packed ping-pong
-        // buffer. Byte 0 is written only after CS is asserted so the shared
-        // RS-485 bus remains idle until this slave is selected.
+        // buffer. Keep the full frame contiguous so the peripheral sees the
+        // same DMA-fed byte stream pattern as the older working RTDP code.
         dma_channel_configure(RTDP_dma_tx_chan, &tx_cfg,
                               &spi_get_hw(spi0)->dr, // write to SPI TX FIFO
-                              &RTDP_dma_buf[buf_idx][1], // read remaining bytes
-                              RTDP_BUF_BYTES - 1,
+                              &RTDP_dma_buf[buf_idx][0],
+                              RTDP_BUF_BYTES,
                               false); // start later
-        // Configure RX DMA to drain the SPI RX FIFO into a dummy byte.
+        // Configure RX DMA to drain the SPI RX FIFO into a throwaway buffer.
         // The PL022 is full-duplex: without draining, the RX FIFO fills after
         // 4 bytes and the TX stalls.
         dma_channel_configure(RTDP_dma_rx_chan, &rx_cfg,
-                              &RTDP_rx_dummy,         // write to dummy (no increment)
+                              &RTDP_rx_buf[0],        // write to discard buffer
                               &spi_get_hw(spi0)->dr,  // read from SPI RX FIFO
                               RTDP_BUF_BYTES,
                               false); // start later
+        dma_start_channel_mask((1u << RTDP_dma_tx_chan) | (1u << RTDP_dma_rx_chan));
         assert_data_ready();
         //
         timeout = time_us_64() + timeout_period_us;
@@ -304,11 +305,9 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
         while (gpio_get(SPI0_CSn_PIN)) {
             if (time_reached(timeout)) { goto timed_out; }
         }
-        // CS is now low — this slave is selected. Enable the line driver,
-        // stage the sync header, then let DMA feed the remaining bytes.
+        // CS is now low — this slave is selected. Enable the line driver so
+        // the already-staged bytes can reach the shared bus.
         enable_RTDP_transceiver();
-        spi_get_hw(spi0)->dr = RTDP_dma_buf[buf_idx][0];
-        dma_start_channel_mask((1u << RTDP_dma_tx_chan) | (1u << RTDP_dma_rx_chan));
         // Wait for all bytes to be clocked out.
         while (dma_channel_is_busy(RTDP_dma_tx_chan) ||
                dma_channel_is_busy(RTDP_dma_rx_chan)) {
@@ -976,10 +975,8 @@ void interpret_command(char* cmdStr)
 
 int main()
 {
-    // Overclock to 300 MHz to raise the SPI slave clock ceiling.
-    // RP2350 Section 12.3.4.4: max SPI slave clock = f_sys / 12.
-    // At 300 MHz the ceiling is 25 MHz, comfortably above the 20 MHz
-    // target for the Real-Time Data Port.
+    // Overclock to 300 MHz to preserve headroom for the rest of the
+    // application while debugging RTDP at a conservative transport speed.
     set_sys_clock_khz(300000, true);
 	set_registers_to_original_values();
     stdio_init_all();
