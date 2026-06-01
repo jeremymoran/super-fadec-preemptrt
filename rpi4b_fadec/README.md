@@ -31,51 +31,50 @@ In the current setup, the **Pico acts as the SPI slave** and the **Raspberry Pi 
 | 21          | RTDP_REn       | Output    | RS-485 Receiver Enable (active low)   | Low = receiver enabled |
 
 ### FADEC External Hardware
-- **ISL83491 transceiver**
+- Full-duplex RS-485/RS-422 transceiver on each slave return path
   - Pico GPIO19 -> DI (driver input)
   - Transceiver A/B differential pair -> FADEC master
   - DE -> GPIO20
   - /RE -> GPIO21
 
+The Pi-side software does not depend on a specific transceiver part number.
+It assumes only that the slave-side driver enable is active-high and the
+receiver enable is active-low, matching the checked-in RP2350 firmware.
+
 **SPI Mode:** Mode 3 (CPOL=1, CPHA=1)  
 **Clock/Data transport:** `SCK` and returned RTDP data both pass through RS-485 line drivers  
 **Checked-in RTDP default:** `RTDP_SPI_HZ = 2 MHz` in the shared `rtdp.h` config header
 
-### Propagation Limits Of The Line Drivers
+### Transport Timing Through The Line Drivers
 
-The ISL83491 is a **10 Mbps full-duplex RS-485/RS-422 transceiver**, but that
-headline number does **not** translate directly into a safe SPI clock frequency.
-In this RTDP design the line drivers are carrying **two timing-related paths**:
+The line-driver headline data rate does **not** translate directly into a safe
+SPI clock frequency. In this RTDP design the line drivers are carrying two
+timing-related paths:
 
 - the Pi-generated `SCK` path to the Pico slave
 - the Pico-returned RTDP data path back to the Pi
 
-Those two paths do not have exactly the same delay. Even when both waveforms look
-clean on a logic analyser, the **difference in propagation delay and skew** between
-the clock path and the data path reduces the setup/hold margin seen by the SPI
-receiver.
+Those two paths do not have exactly the same delay. Even when both waveforms
+look clean on a logic analyser, the difference in propagation delay, skew, and
+driver-enable behaviour between the clock path and the data path reduces the
+setup/hold margin seen by the SPI receiver.
 
 That matters much more for SPI than for asynchronous serial links:
 
 - a UART-style "10 Mbps" part only has to move bits quickly enough
 - SPI must deliver data with the correct timing **relative to the sampling edge of the clock**
 
-In practice, the ISL83491 therefore limits the usable RTDP SPI clock well below
-its nominal line-rate number, especially when:
+In practice, the usable RTDP SPI clock can be much lower than the nominal
+line-rate number, especially when:
 
 - `SCK` and returned data use separate transceiver channels
 - the bus has stubs or shared-node loading
 - cable length, termination, or biasing are not ideal
 - the master samples close to the edge of the available timing window
 
-Observed behaviour on this hardware has been:
-
-- `2 MHz`: reliable
-- `6-8 MHz`: marginal / sensitive to conditions
-- `20 MHz`: not reliable
-
-So the practical ceiling is set by **clock-to-data timing margin through the
-line drivers**, not by the RP2350 firmware alone.
+The checked-in transport clock is `2 MHz` via `RTDP_SPI_HZ` in `rtdp.h`.
+Higher rates must be revalidated on the actual transceiver, cable, and loading
+combination in use.
 
 ### RTDP Frame Format
 
@@ -105,12 +104,11 @@ The Pi validates byte 0 against `0xEB`. Frames with any other first byte are tre
 1. Waits for a buffer index from Core 0.
 2. (Re)initialises SPI0 as a **Mode 3 slave** if needed.
 3. Drains any stale SPI RX FIFO state from previous traffic.
-4. Preloads byte 0 (`0xEB`) into the SPI TX FIFO before advertising readiness.
-5. Configures TX DMA for the remaining bytes (1..12).
-6. Configures RX DMA to drain the receive side so the full-duplex SPI peripheral does not stall.
+4. Configures TX DMA for the full 13-byte frame.
+5. Configures RX DMA to drain the receive side so the full-duplex SPI peripheral does not stall.
 7. Asserts **DATA_RDY**.
 8. Waits for the external master to pull **CSn** low.
-9. Enables the ISL83491 driver only after **CSn** goes low, so the shared RS-485 bus is not driven early.
+9. Enables the slave transceiver driver only after **CSn** goes low, so the shared return bus is not driven early.
 10. Waits for the full transfer and for **CSn** to return high.
 11. Drains residual SPI state, disables the transceiver, clears **DATA_RDY**, and returns to idle.
 
@@ -123,9 +121,11 @@ If the external master does **not** respond within the timeout (`vregister[7]`),
   timing of `SCK` and returned data at the Pi input after both line-driver paths.
 - The Pico stages the RTDP frame before clocking begins, but higher SPI clocks can
   still fail if the returned data arrives too late relative to the Pi sampling edge.
-- The Pi FADEC code inserts a short CS-setup delay before starting `SCK`, but this
-  only covers slave select and driver turn-on. It does **not** remove propagation
-  skew between the RS-485 clock path and the RS-485 data-return path.
+- The Pi FADEC code inserts a configurable CS-setup delay before starting `SCK`.
+  The checked-in default is `20 us`, and it can be overridden at runtime with
+  `FADEC_CS_SETUP_DELAY_NS`.
+- That delay only covers slave select and driver turn-on. It does **not** remove
+  propagation skew between the RS-485 clock path and the RS-485 data-return path.
 - If header bytes begin to corrupt at higher speeds, treat that as a transport-margin
   problem first, not as an ADC or packet-format problem.
 
@@ -142,7 +142,7 @@ RTDP is **not** the main bulk-recording path. The normal logging loop still writ
 while (true) {
     if (DATA_RDY == HIGH) {
         pull CSn LOW;
-        delay_us(2);            // allow slave + transceiver path to settle
+        delay_us(cs_setup_margin_us); // allow the selected transport path to settle
         uint8_t rx[13];
         spi_transfer(rx, 13);   // dummy TX bytes are ignored by the slave
         release CSn;

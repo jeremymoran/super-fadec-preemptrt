@@ -6,14 +6,14 @@
  * ///////
  * This program runs on a Raspberry Pi 4B and acts as the "master" controller
  * that reads live ADC (analogue-to-digital converter) data from up to six
- * RP2350 slave microcontroller boards.  Each slave board contains an
- * ADS131M08 8-channel 24-bit ADC and streams its most recent sample set
+ * RP2350 slave microcontroller boards.  Each slave board currently exposes
+ * a 4-channel RTDP sample set sourced from an ADS131M04-class 24-bit ADC
  * over an RS-485 serial bus using the SPI protocol.
  *
  * HOW THE HARDWARE TALKS
  * //////////////////////
  * 1. Each slave asserts its DATA_RDY (DRDY) GPIO pin HIGH when a fresh
- *    16-byte sample frame is ready to be read.
+ *    13-byte RTDP frame is ready to be read.
  * 2. This program detects that rising edge and immediately pulls the
  *    slave's Chip Select (CS) line LOW (CS is "active low" — LOW means
  *    "talk to me").
@@ -25,10 +25,12 @@
  *    24-bit signed integers (big-endian, MSB first), sign-extended to
  *    int32_t on decode.  Frames whose header byte is not 0xEB are dropped.
  *
- * TWO-THREAD ARCHITECTURE
- * ///////////////////////
- * The program uses two POSIX threads (pthreads) pinned to isolated CPU
- * cores so they never interfere with each other or with the Linux kernel:
+ * THREAD ARCHITECTURE
+ * ///////////////////
+ * The program uses two real-time worker threads plus the unstart policy
+ * thread.  The acquisition and processing threads are pinned away from the
+ * Linux housekeeping core so they do not interfere with each other or with
+ * normal kernel work:
  *
  *   Thread        Core   Priority           Job
  *   ///////////   ////   ////////////////   ////////////////////////////
@@ -38,20 +40,23 @@
  *   proc_thread    2     SCHED_FIFO / 50    Pops frames from the ring
  *                        (lower RT)          buffer, decodes them, prints
  *                                            results and statistics.
+ *   unstart_thread 3     default policy     Maintains schedule/trigger
+ *                                            state used to order ready
+ *                                            ports during acquisition.
  *
  * The ring buffer (defined in fadec.h) is a lock-free single-producer /
  * single-consumer queue that lets the two threads exchange data without
  * any mutexes (locks), which would introduce unpredictable latency.
  *
- * REQUIRED BOOT OPTION (isolate cores 1 and 2 from Linux scheduling)
- * ///////////////////////////////////////////////////////////////////
+ * RECOMMENDED BOOT OPTION (isolate cores 1 and 2 from Linux scheduling)
+ * //////////////////////////////////////////////////////////////////////
  * Add to /boot/firmware/cmdline.txt (all on one line):
  *   isolcpus=1,2 nohz_full=1,2 rcu_nocbs=1,2
  *
  *   core 0  Linux kernel, IRQs, housekeeping  (untouched)
  *   core 1  acq_thread — DRDY polling + SPI   (real-time, isolated)
  *   core 2  proc_thread — data processing     (real-time, isolated)
- *   core 3  spare / Linux overflow / logging  (untouched)
+ *   core 3  unstart_thread / light control work (not latency-critical)
  *
  * HARDWARE PIN MAPPING (Raspberry Pi 4B GPIO header)
  * ///////////////////////////////////////////////////
@@ -71,13 +76,13 @@
  *   CS4      GPIO 18   OUTPUT    Chip-select board 4
  *   CS5      GPIO 20   OUTPUT    Chip-select board 5
  *   CS6      GPIO 21   OUTPUT    Chip-select board 6
- *   DE       GPIO 24   OUTPUT    RS-485 ENABLE CLOCK OUTPUT (IMPORTANT)
- *   REN      GPIO 25   OUTPUT    RS-485 RECEIVER ENABLE (IMPORTANT)
+ *   DE       GPIO 24   OUTPUT    RS-485 driver enable for forwarded SCK
+ *   REN      GPIO 25   OUTPUT    RS-485 receiver enable for returned data
  *
  * SPI PROTOCOL DETAILS
  * ////////////////////
  *   - Mode 3: clock idles HIGH (CPOL=1), data sampled on falling edge (CPHA=1)
- *   - Maximum clock speed: 10 MHz (supported by RP2350 RTDP firmware)
+ *   - Clock frequency: RTDP_SPI_HZ from ../rtdp.h (2 MHz checked in here)
  *   - Frame size: 13 bytes = 1 sync header (0xEB) + 4 channels x 3 bytes (24-bit signed, big-endian)
  *   - MOSI (Pi→slave) bytes are ignored by the slave; we send zeros
  *
@@ -235,15 +240,17 @@ static const unsigned int CS_GPIO[N_SLAVES] = {
  *               We use SPI_NO_CS to disable the kernel's built-in CS
  *               toggling and drive CS ourselves via GPIO.
  * SPI_HZ      — clock frequency for the RTDP transport.
- * FRAME_BYTES — each read fetches exactly 12 bytes: 4 channels × 3 bytes.
- * EVT_BATCH   — how many GPIO edge events to drain in one go per wakeup.
- *               64 is generous; in practice we rarely see more than 1-2
- *               at a time, but batching avoids extra syscall overhead.
+ * FRAME_BYTES — each read fetches exactly 13 bytes: sync header + payload.
+ * CS_SETUP_DELAY_NS — hard-coded quiet time between CS low and the first
+ *               SCK edge.
+ * EVT_BATCH   — legacy batch size from the earlier libgpiod edge-event
+ *               implementation; retained only so older notes still map
+ *               to the code.
  */
 #define SPI_DEVICE   "/dev/spidev0.0"
 #define SPI_HZ       RTDP_SPI_HZ /* shared with Pico RTDP firmware          */
 #define FRAME_BYTES  13u         /* 1 sync header (0xEB) + 4 × 24-bit = 13 bytes */
-#define CS_SETUP_DELAY_NS 5000u  /* CS low to first clock; shared-bus turnaround margin */
+#define CS_SETUP_DELAY_NS 40000u  /* hard-coded post-CS quiet time                        */
 #define EVT_BATCH    64          /* edge events per batch read */
 
 
@@ -406,20 +413,18 @@ out:
 /*
  * request_drdy_lines()
  * ////////////////////
- * Requests all N_SLAVES DRDY pins at once as INPUTS with RISING-EDGE
- * detection and an internal PULL-DOWN resistor.
- *
- * RISING EDGE means the kernel records an event only when the pin
- * transitions from LOW to HIGH (0→1) — exactly when a slave signals
- * "new data ready".
+ * Requests all N_SLAVES DRDY pins at once as INPUTS with an internal
+ * PULL-DOWN resistor. Rising-edge detection is also enabled so the line
+ * request matches the electrical behaviour of the signal, but the hot path
+ * no longer waits on kernel GPIO events.
  *
  * PULL-DOWN means any pin not physically wired to anything is held at
  * a known LOW level by an internal resistor, preventing random noise
  * from generating spurious "data ready" events.
  *
- * By requesting all 6 DRDY lines in a single call we get a single file
- * descriptor that wakes up when ANY of them fire — much cheaper than
- * polling 6 separate file descriptors with select/poll/epoll.
+ * By requesting all 6 DRDY lines in a single call we configure direction
+ * and biasing consistently for every port. The acquisition loop then polls
+ * the raw GPIO level register directly for minimum latency.
  */
 static struct gpiod_line_request *request_drdy_lines(struct gpiod_chip *chip)
 {
@@ -452,9 +457,9 @@ out:
  * //////////////////////////////////////////////////////////////////////////
  *
  * This is the real-time "hot path" of the program.  Its only jobs are:
- *   1. Wait for a DRDY rising edge (blocking, zero CPU when idle).
+ *   1. Poll for a DRDY rising edge using the memory-mapped GPIO register.
  *   2. Assert CS for the slave that fired.
- *   3. Perform a 16-byte SPI read.
+ *   3. Perform a 13-byte SPI read.
  *   4. Deassert CS.
  *   5. Decode the raw bytes into four int32_t channel values.
  *   6. Push the decoded frame into the ring buffer for proc_thread.
@@ -540,7 +545,7 @@ static void *acq_thread(void *arg)
     struct gpiod_line_request      *cs_req[N_SLAVES];/* CS output per slave  */
     struct gpiod_line_request      *de_req   = NULL; /* RS-485 DE line       */
     struct gpiod_line_request      *ren_req  = NULL; /* RS-485 /RE line      */
-    struct gpiod_edge_event_buffer *evt_buf  = NULL; /* edge event buffer    */
+    struct gpiod_edge_event_buffer *evt_buf  = NULL; /* legacy cleanup slot  */
     int                             spi_fd   = -1;   /* SPI device fd        */
     volatile uint32_t              *gpio_regs = NULL; /* BCM2711 register map */
 
@@ -560,9 +565,9 @@ static void *acq_thread(void *arg)
 
     /* RS-485 DRIVER ENABLE (DE) — HOLD HIGH
      * ////////////////////////////////////////
-     * The Pi's SPI CLK (GPIO 11) is wired to the ISL83491 DI pin.
-     * DE must be HIGH to enable the line driver so the clock signal
-     * is transmitted over the differential pair to the RP2350 slave.
+     * The Pi's SPI CLK (GPIO 11) is wired into the external line-driver
+     * transmit path. DE must be HIGH so the forwarded clock reaches the
+     * selected RP2350 slave over the differential pair.
      * GPIOD_LINE_VALUE_ACTIVE = logical HIGH on this output pin.
      */
     de_req = request_output_line(chip, GPIO_DE, GPIOD_LINE_VALUE_ACTIVE);
@@ -603,10 +608,11 @@ static void *acq_thread(void *arg)
         printf("[acq] CS%d  GPIO %-2u  OK\n", i + 1, CS_GPIO[i]);
     }
 
-    /* ALL 6 DRDY INPUT LINES — RISING EDGE, PULL-DOWN
-     * /////////////////////////////////////////////////
-     * A single request for all six lines.  The kernel will wake us up
-     * whenever ANY of them transitions LOW→HIGH.
+    /* ALL 6 DRDY INPUT LINES — INPUT + PULL-DOWN
+     * ////////////////////////////////////////////
+     * A single request configures all six lines with consistent direction,
+     * biasing, and edge metadata. The hot loop below polls GPLEV0 directly
+     * instead of waiting on the kernel GPIO event path.
      */
     drdy_req = request_drdy_lines(chip);
     if (!drdy_req) {
@@ -626,7 +632,7 @@ static void *acq_thread(void *arg)
      *   SPI_MODE_3   — CPOL=1 (clock idle high), CPHA=1 (sample on 2nd edge)
      *   SPI_NO_CS    — disable kernel CE0 toggling; we drive CS via GPIO
      *   8 bits/word  — standard byte-oriented transfers
-     *   10 MHz       — RP2350 RTDP maximum supported clock
+    *   SPI_HZ       — shared RTDP transport clock from rtdp.h
      *
      * SPI_IOC_WR_MODE32 is used (not SPI_IOC_WR_MODE) because SPI_NO_CS
      * lives in bit 6 which doesn't fit in a uint8_t.  Using a uint32_t
@@ -674,7 +680,7 @@ static void *acq_thread(void *arg)
         xfer[i].tx_buf        = (uint64_t)(uintptr_t)tx_zero;
         xfer[i].rx_buf        = (uint64_t)(uintptr_t)rx[i];
         xfer[i].len           = FRAME_BYTES;   /* 13 bytes per read          */
-        xfer[i].speed_hz      = SPI_HZ;        /* 10 MHz                     */
+        xfer[i].speed_hz      = SPI_HZ;        /* shared RTDP clock          */
         xfer[i].bits_per_word = 8;             /* 8-bit words                */
         /* cs_change = 0: do not toggle CS between words (we handle it) */
     }
@@ -854,13 +860,13 @@ static void *acq_thread(void *arg)
              * This takes < 1 ns — contrast with ~50 µs for gpiod API. */
             gpio_regs[_GPCLR0] = cs_bit[dev];
 
-            /* CS-SETUP DELAY — wait for RP2350 SPI receiver to enable
+            /* CS-SETUP DELAY — allow the selected RTDP path to settle
              * //////////////////////////////////////////////////////////
-             * The RP2350 SPI slave needs ~1 µs after CS assertion before
-             * it can drive MISO with the correct first byte.  Without this
-             * delay the Pi clocks the first byte before the slave has loaded
-             * its TX register, so byte 0 is undefined/stale — the 0xEB sync
-             * header is never seen.
+             * The first returned byte is timing-sensitive: after CS goes LOW
+             * the slave still has to observe selection and make the outbound
+             * path valid before the Pi starts SCK. The required margin depends
+             * on the fitted transceiver, cabling, and bus loading, so the
+             * delay is hard-coded here.
              * Busy-wait via now_ns() (vDSO clock_gettime — no syscall,
              * no scheduler involvement) to keep latency deterministic. */
             { uint64_t _t0 = now_ns(); while (now_ns() - _t0 < CS_SETUP_DELAY_NS) __asm__ volatile("nop"); }
@@ -868,8 +874,9 @@ static void *acq_thread(void *arg)
             /* SPI READ — 13 BYTES
              * /////////////////////
              * ioctl is still a syscall (~15-20 µs kernel overhead) but
-             * is unavoidable for userspace SPI.  The actual wire time
-             * is 10.4 µs at 10 MHz (13 bytes x 8 bits / 10e6 bps). */
+             * is unavoidable for userspace SPI. The actual wire time is
+             * FRAME_BYTES * 8 / SPI_HZ seconds (52 µs at the checked-in
+             * 2 MHz transport clock). */
             int ret = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &xfer[dev]);
 
             /* DEASSERT CS — SINGLE 32-BIT REGISTER WRITE
@@ -1143,6 +1150,7 @@ int main(void)
 
     printf("FADEC RTDP master\n");
     printf("cores: acq=1 (FIFO/99)  proc=2 (FIFO/50)  unstart=3\n\n");
+    printf("timing: cs_setup=%u ns\n\n", CS_SETUP_DELAY_NS);
 
     /* SPAWN THE TWO WORKER THREADS
      * //////////////////////////////
@@ -1216,8 +1224,7 @@ int main(void)
      *
      *   rate (Hz) = frames_received / elapsed_seconds
      *
-     * We report both raw Hz and kHz for readability.  At 32 kHz you would
-     * expect to see approximately 32000 Hz / 32.0 kHz per active slave.
+    * We report both raw Hz and kHz for readability.
      *
      * Note: elapsed time starts from just before the threads were spawned,
      * so the first few frames during thread startup are included, which
