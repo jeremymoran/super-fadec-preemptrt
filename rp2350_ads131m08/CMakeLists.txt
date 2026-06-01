@@ -38,6 +38,8 @@ add_executable(pico2_daq_ads131m04)
 
 target_sources(pico2_daq_ads131m04 PRIVATE pico2_daq_ads131m04.c)
 
+pico_generate_pio_header(pico2_daq_ads131m04 ${CMAKE_CURRENT_LIST_DIR}/rtdp_transceiver.pio)
+
 # pull in common dependencies
 target_link_libraries(pico2_daq_ads131m04 PRIVATE
 	pico_stdlib
@@ -47,6 +49,7 @@ target_link_libraries(pico2_daq_ads131m04 PRIVATE
 	hardware_spi
     hardware_pwm
     hardware_dma
+    hardware_pio
 	)
 
 # enable uart0

@@ -20,6 +20,7 @@
 #include "hardware/timer.h"
 #include "hardware/spi.h"
 #include "hardware/dma.h"
+#include "hardware/pio.h"
 #include "hardware/pwm.h"
 #include <stdatomic.h>
 #include "pico/binary_info.h"
@@ -28,7 +29,8 @@
 #include <stdlib.h>
 #include <math.h>
 #include <ctype.h>
-#include "rtdp.h"
+#include "rtdp_transceiver.pio.h"
+#include "../rtdp.h"
 
 #define VERSION_STR "v0.5 RP2350 / ADS131M04 as MCU-ADC 2026-05-17"
 
@@ -55,6 +57,11 @@ const uint SPI0_TX_PIN = 19;
 const uint RTDP_DE_PIN = 20;
 const uint RTDP_REn_PIN = 21;
 const uint DATA_RDY_PIN = 27;
+
+static PIO RTDP_transceiver_pio = pio0;
+static uint RTDP_transceiver_sm;
+static uint RTDP_transceiver_offset;
+static bool RTDP_transceiver_pio_ready;
 
 
 static inline void assert_ready()
@@ -115,16 +122,33 @@ static inline void clear_data_ready()
     gpio_put(DATA_RDY_PIN, 0);
 }
 
-static inline void enable_RTDP_transceiver()
+static inline void arm_RTDP_transceiver()
 {
-    gpio_put_masked((1u << RTDP_REn_PIN) | (1u << RTDP_DE_PIN),
-                    (1u << RTDP_DE_PIN));
+    pio_sm_set_enabled(RTDP_transceiver_pio, RTDP_transceiver_sm, false);
+    rtdp_transceiver_program_init(RTDP_transceiver_pio, RTDP_transceiver_sm,
+                                  RTDP_transceiver_offset, RTDP_DE_PIN);
+    pio_sm_set_enabled(RTDP_transceiver_pio, RTDP_transceiver_sm, true);
 }
 
-static inline void disable_RTDP_transceiver()
+static inline void disarm_RTDP_transceiver()
 {
-    gpio_put_masked((1u << RTDP_REn_PIN) | (1u << RTDP_DE_PIN),
-                    (1u << RTDP_REn_PIN));
+    uint32_t mask = (1u << RTDP_DE_PIN) | (1u << RTDP_REn_PIN);
+    pio_sm_set_enabled(RTDP_transceiver_pio, RTDP_transceiver_sm, false);
+    pio_sm_set_pins_with_mask(RTDP_transceiver_pio, RTDP_transceiver_sm, 0u, mask);
+}
+
+static void init_RTDP_transceiver_pio(void)
+{
+    if (RTDP_transceiver_pio_ready) {
+        return;
+    }
+    RTDP_transceiver_sm = pio_claim_unused_sm(RTDP_transceiver_pio, true);
+    RTDP_transceiver_offset = pio_add_program(RTDP_transceiver_pio,
+                                              &rtdp_transceiver_program);
+    rtdp_transceiver_program_init(RTDP_transceiver_pio, RTDP_transceiver_sm,
+                                  RTDP_transceiver_offset, RTDP_DE_PIN);
+    disarm_RTDP_transceiver();
+    RTDP_transceiver_pio_ready = true;
 }
 
 static inline void drain_RTDP_spi_rx_fifo(void)
@@ -297,6 +321,7 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
                               RTDP_BUF_BYTES,
                               false); // start later
         dma_start_channel_mask((1u << RTDP_dma_tx_chan) | (1u << RTDP_dma_rx_chan));
+        arm_RTDP_transceiver();
         assert_data_ready();
         //
         timeout = time_us_64() + timeout_period_us;
@@ -305,9 +330,6 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
         while (gpio_get(SPI0_CSn_PIN)) {
             if (time_reached(timeout)) { goto timed_out; }
         }
-        // CS is now low — this slave is selected. Enable the line driver so
-        // the already-staged bytes can reach the shared bus.
-        enable_RTDP_transceiver();
         // Wait for all bytes to be clocked out.
         while (dma_channel_is_busy(RTDP_dma_tx_chan) ||
                dma_channel_is_busy(RTDP_dma_rx_chan)) {
@@ -331,7 +353,7 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
             if (time_reached(timeout)) { break; }
         }
     finish:
-        disable_RTDP_transceiver();
+        disarm_RTDP_transceiver();
         clear_data_ready();
         RTDP_status_store(RTDP_IDLE);
     } // end while
@@ -1074,7 +1096,7 @@ int main()
     gpio_init(RTDP_REn_PIN);
     gpio_set_dir(RTDP_REn_PIN, GPIO_OUT);
     gpio_disable_pulls(RTDP_REn_PIN);
-    disable_RTDP_transceiver();
+    init_RTDP_transceiver_pio();
     // Second, the DATA_RDY signal.
     gpio_init(DATA_RDY_PIN);
     gpio_set_dir(DATA_RDY_PIN, GPIO_OUT);

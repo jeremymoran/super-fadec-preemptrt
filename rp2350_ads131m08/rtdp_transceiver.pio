@@ -1,0 +1,27 @@
+.program rtdp_transceiver
+
+; Drive the RTDP transceiver directly from chip-select edges.
+; Pins are configured so bit 0 maps to GPIO20 (DE) and bit 1 maps to GPIO21 (/RE).
+; /RE is held low continuously; only DE toggles with CS.
+
+.wrap_target
+    set pins, 0         ; DE=0, /RE=0
+wait_for_cs_low:
+    wait 0 gpio 17
+    set pins, 1         ; DE=1, /RE=0
+wait_for_cs_high:
+    wait 1 gpio 17
+    set pins, 0         ; DE=0, /RE=0
+.wrap
+
+% c-sdk {
+static inline void rtdp_transceiver_program_init(PIO pio, uint sm, uint offset, uint de_pin) {
+    pio_gpio_init(pio, de_pin);
+    pio_gpio_init(pio, de_pin + 1u);
+    pio_sm_set_consecutive_pindirs(pio, sm, de_pin, 2, true);
+    pio_sm_config cfg = rtdp_transceiver_program_get_default_config(offset);
+    sm_config_set_set_pins(&cfg, de_pin, 2);
+    sm_config_set_clkdiv(&cfg, 1.0f);
+    pio_sm_init(pio, sm, offset, &cfg);
+}
+%}
