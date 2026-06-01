@@ -250,7 +250,7 @@ static const unsigned int CS_GPIO[N_SLAVES] = {
 #define SPI_DEVICE   "/dev/spidev0.0"
 #define SPI_HZ       RTDP_SPI_HZ /* shared with Pico RTDP firmware          */
 #define FRAME_BYTES  13u         /* 1 sync header (0xEB) + 4 × 24-bit = 13 bytes */
-#define CS_SETUP_DELAY_NS 40000u  /* hard-coded post-CS quiet time                        */
+#define CS_SETUP_DELAY_NS 500u  /* hard-coded post-CS quiet time                        */
 #define EVT_BATCH    64          /* edge events per batch read */
 
 
